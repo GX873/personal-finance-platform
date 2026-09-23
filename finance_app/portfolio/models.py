@@ -4,8 +4,9 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
     Date,
-    DateTime,
     ForeignKey,
     Integer,
     String,
@@ -14,22 +15,31 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from finance_app.db import Base, utc_now
+from finance_app.db import Base, UtcDateTime, utc_now
 from finance_app.ledger.models import DECIMAL_24_8
 
 
 class AllocationTarget(Base):
     __tablename__ = "allocation_targets"
+    __table_args__ = (
+        CheckConstraint(
+            "target_bps BETWEEN 0 AND 10000", name="ck_allocation_targets_target_bps"
+        ),
+        CheckConstraint(
+            "upper_bps IS NULL OR upper_bps BETWEEN 0 AND 10000",
+            name="ck_allocation_targets_upper_bps",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     target_bps: Mapped[int] = mapped_column(Integer, nullable=False)
     upper_bps: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
@@ -53,7 +63,7 @@ class PriceSnapshot(Base):
     price: Mapped[Decimal] = mapped_column(DECIMAL_24_8, nullable=False)
     source_url: Mapped[str | None] = mapped_column(Text)
     fetched_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
     error_text: Mapped[str | None] = mapped_column(Text)
 
@@ -66,13 +76,13 @@ class PortfolioSnapshot(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
-    total_value_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_value_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     invested_value_cents: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0
+        BigInteger, nullable=False, default=0
     )
-    cash_value_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cash_value_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
 
 
@@ -85,6 +95,6 @@ class Alert(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(UtcDateTime())

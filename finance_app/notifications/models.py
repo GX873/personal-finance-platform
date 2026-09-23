@@ -5,7 +5,6 @@ from datetime import date, datetime
 from sqlalchemy import (
     Boolean,
     Date,
-    DateTime,
     ForeignKey,
     Integer,
     String,
@@ -14,7 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from finance_app.db import Base, utc_now
+from finance_app.db import Base, UtcDateTime, utc_now
 
 
 class NotificationChannel(Base):
@@ -25,10 +24,10 @@ class NotificationChannel(Base):
     channel_type: Mapped[str] = mapped_column(String(64), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
@@ -43,9 +42,9 @@ class NotificationDelivery(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_summary: Mapped[str | None] = mapped_column(Text)
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
 
 
@@ -57,7 +56,7 @@ class ImportBatch(Base):
     filename: Mapped[str | None] = mapped_column(String(512))
     source: Mapped[str | None] = mapped_column(String(64))
     imported_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
 
 
@@ -68,7 +67,7 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
@@ -85,7 +84,7 @@ class JobRun(Base):
     business_date: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     error_summary: Mapped[str | None] = mapped_column(Text)

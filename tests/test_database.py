@@ -7,29 +7,48 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from alembic import command
 from finance_app.auth.models import User
-from finance_app.db import Base, configure_sqlite, create_db_engine
-from finance_app.ledger.models import Account, Asset, Holding, Transaction
+from finance_app.db import (
+    create_db_engine,
+    get_engine,
+    get_session_factory,
+    reset_database_state,
+    utc_now,
+)
+from finance_app.ledger.models import (
+    Account,
+    Asset,
+    Holding,
+    PortfolioRole,
+    RiskLevel,
+    Transaction,
+)
 from finance_app.notifications.models import AppSetting, ImportBatch, JobRun
 from finance_app.portfolio.models import PriceSnapshot
 
 
 @pytest.fixture
-def db_session(tmp_path) -> Iterator[Session]:
-    engine = create_engine(f"sqlite:///{tmp_path / 'finance.db'}")
-    configure_sqlite(engine)
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine, expire_on_commit=False)()
+def db_session(tmp_path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Session]:
+    database_url = f"sqlite:///{tmp_path / 'finance.db'}"
+    monkeypatch.setenv("FINANCE_DATABASE_URL", database_url)
+    from finance_app.config import get_settings
+
+    get_settings.cache_clear()
+    reset_database_state()
+    command.upgrade(Config("alembic.ini"), "head")
+    engine = create_db_engine(database_url)
+    session = get_session_factory(engine)()
     try:
         yield session
     finally:
         session.close()
         engine.dispose()
+        reset_database_state()
 
 
 def test_sqlite_enables_foreign_keys_wal_and_busy_timeout(db_session: Session):
@@ -47,6 +66,23 @@ def test_engine_creates_configured_sqlite_parent_directory(tmp_path):
     finally:
         engine.dispose()
     assert database_path.exists()
+
+
+def test_application_session_factory_reuses_one_engine(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("FINANCE_DATABASE_URL", f"sqlite:///{tmp_path / 'app.db'}")
+    from finance_app.config import get_settings
+
+    get_settings.cache_clear()
+    reset_database_state()
+    try:
+        first_engine = get_engine()
+        second_engine = get_engine()
+        assert first_engine is second_engine
+        assert get_session_factory().kw["bind"] is first_engine
+    finally:
+        reset_database_state()
 
 
 def test_alembic_upgrade_creates_configured_sqlite_parent_directory(
@@ -94,12 +130,72 @@ def test_schema_uses_integer_cents_decimal_values_and_utc_timestamps(
     assert transaction.created_at.tzinfo is not None
 
 
+def test_persisted_timestamps_are_utc_aware_after_reload(db_session: Session):
+    account = Account(name="cash", kind="cash", currency="CNY")
+    db_session.add(account)
+    db_session.commit()
+    account_id = account.id
+    db_session.expunge_all()
+
+    reloaded = db_session.get(Account, account_id)
+    assert reloaded is not None
+    assert reloaded.created_at.tzinfo is not None
+    assert reloaded.created_at.utcoffset().total_seconds() == 0
+    assert reloaded.created_at <= utc_now()
+
+
+def test_assets_and_holdings_capture_risk_role_and_price_freshness(db_session: Session):
+    account = Account(name="broker", kind="brokerage", currency="CNY")
+    asset = Asset(
+        code="000001",
+        market="CN",
+        name="Fund",
+        risk_level=RiskLevel.MEDIUM,
+        portfolio_role=PortfolioRole.CORE,
+    )
+    db_session.add_all((account, asset))
+    db_session.commit()
+
+    holding = Holding(
+        account_id=account.id,
+        asset_id=asset.id,
+        quantity=Decimal(1),
+        valuation_cents=123_45,
+        last_price=Decimal("123.45"),
+        price_source="manual",
+        is_price_stale=False,
+    )
+    db_session.add(holding)
+    db_session.commit()
+    assert holding.valuation_cents == 123_45
+    assert holding.last_price == Decimal("123.45000000")
+
+
 def test_schema_enforces_required_unique_keys(db_session: Session):
     account = Account(name="cash", kind="cash", currency="CNY")
     asset = Asset(code="000001", market="CN", name="Fund")
     db_session.add_all((User(username="admin", password_hash="hash"), account, asset))
     db_session.commit()
     db_session.add(User(username="admin", password_hash="other"))
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+
+def test_schema_rejects_negative_fees(db_session: Session):
+    account = Account(name="cash", kind="cash", currency="CNY")
+    asset = Asset(code="000001", market="CN", name="Fund")
+    db_session.add_all((account, asset))
+    db_session.commit()
+    db_session.add(
+        Transaction(
+            source="manual",
+            external_id="negative-fee",
+            kind="buy",
+            account_id=account.id,
+            asset_id=asset.id,
+            fee_cents=-1,
+        )
+    )
     with pytest.raises(IntegrityError):
         db_session.commit()
     db_session.rollback()
@@ -141,7 +237,7 @@ def test_metadata_includes_initial_migration_tables_and_constraints(
     db_session: Session,
 ):
     inspector = inspect(db_session.bind)
-    assert set(inspector.get_table_names()) == {
+    assert set(inspector.get_table_names()) - {"alembic_version"} == {
         "accounts",
         "alerts",
         "allocation_targets",
@@ -166,3 +262,7 @@ def test_metadata_includes_initial_migration_tables_and_constraints(
     assert "uq_price_snapshots_asset_valuation_source" in constraints
     assert PriceSnapshot.__table__.c.price.type.precision == 24
     assert PriceSnapshot.__table__.c.price.type.scale == 8
+    assert (
+        db_session.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+        == "0001"
+    )

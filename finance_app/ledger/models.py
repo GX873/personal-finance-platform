@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from sqlalchemy import (
-    DateTime,
+    BigInteger,
+    CheckConstraint,
     ForeignKey,
     Integer,
     Numeric,
@@ -14,9 +16,20 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from finance_app.db import Base, utc_now
+from finance_app.db import Base, UtcDateTime, utc_now
 
 DECIMAL_24_8 = Numeric(24, 8)
+
+
+class RiskLevel(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class PortfolioRole(StrEnum):
+    CORE = "core"
+    SATELLITE = "satellite"
 
 
 class Account(Base):
@@ -27,13 +40,13 @@ class Account(Base):
     kind: Mapped[str] = mapped_column(String(50), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="CNY")
     opening_balance_cents: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0
+        BigInteger, nullable=False, default=0
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
@@ -46,12 +59,18 @@ class Asset(Base):
     market: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     asset_class: Mapped[str | None] = mapped_column(String(64))
+    risk_level: Mapped[RiskLevel] = mapped_column(
+        String(16), nullable=False, default=RiskLevel.MEDIUM
+    )
+    portfolio_role: Mapped[PortfolioRole] = mapped_column(
+        String(16), nullable=False, default=PortfolioRole.CORE
+    )
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="CNY")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
@@ -61,6 +80,7 @@ class Transaction(Base):
         UniqueConstraint(
             "source", "external_id", name="uq_transactions_source_external_id"
         ),
+        CheckConstraint("fee_cents >= 0", name="ck_transactions_fee_nonnegative"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -73,21 +93,21 @@ class Transaction(Base):
     asset_id: Mapped[int | None] = mapped_column(
         ForeignKey("assets.id", ondelete="RESTRICT")
     )
-    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     quantity: Mapped[Decimal] = mapped_column(
         DECIMAL_24_8, nullable=False, default=Decimal(0)
     )
     price: Mapped[Decimal | None] = mapped_column(DECIMAL_24_8)
-    fee_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fee_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     occurred_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
     description: Mapped[str | None] = mapped_column(Text)
     reverses_transaction_id: Mapped[int | None] = mapped_column(
         ForeignKey("transactions.id", ondelete="RESTRICT")
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
 
 
@@ -107,9 +127,14 @@ class Holding(Base):
     quantity: Mapped[Decimal] = mapped_column(
         DECIMAL_24_8, nullable=False, default=Decimal(0)
     )
-    cost_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    valuation_cents: Mapped[int | None] = mapped_column(BigInteger)
+    last_price: Mapped[Decimal | None] = mapped_column(DECIMAL_24_8)
+    price_source: Mapped[str | None] = mapped_column(String(64))
+    price_fetched_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    is_price_stale: Mapped[bool] = mapped_column(default=True, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
@@ -118,9 +143,9 @@ class CashBucket(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     bucket_kind: Mapped[str] = mapped_column(String(64), nullable=False)
-    balance_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    balance_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
     )
 
 
@@ -130,14 +155,18 @@ class MonthlyBudget(Base):
         UniqueConstraint(
             "month", "bucket_kind", name="uq_monthly_budgets_month_bucket_kind"
         ),
+        CheckConstraint(
+            "length(month) = 7 AND month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'",
+            name="ck_monthly_budgets_month",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     month: Mapped[str] = mapped_column(String(7), nullable=False)
     bucket_kind: Mapped[str] = mapped_column(String(64), nullable=False)
-    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )
 
 
@@ -150,5 +179,5 @@ class AuditEvent(Base):
     entity_id: Mapped[int | None] = mapped_column(Integer)
     details_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
+        UtcDateTime(), default=utc_now, nullable=False
     )

@@ -4,9 +4,10 @@ from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import DateTime, Engine, create_engine, event
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.types import TypeDecorator
 
 from finance_app.config import get_settings
 
@@ -18,6 +19,23 @@ def utc_now() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+class UtcDateTime(TypeDecorator[datetime]):
+    """Store UTC-naive values for SQLite but always return aware UTC datetimes."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("datetime values must be timezone-aware")
+        return value.astimezone(UTC).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect) -> datetime | None:
+        return value.replace(tzinfo=UTC) if value is not None else None
 
 
 def configure_sqlite(engine: Engine) -> Engine:
@@ -65,8 +83,39 @@ def create_session_factory(database_url: str | None = None) -> sessionmaker[Sess
     )
 
 
+_engine: Engine | None = None
+_session_factory: sessionmaker[Session] | None = None
+
+
+def get_engine() -> Engine:
+    global _engine
+    if _engine is None:
+        _engine = create_db_engine()
+    return _engine
+
+
+def get_session_factory(engine: Engine | None = None) -> sessionmaker[Session]:
+    global _session_factory
+    if engine is not None:
+        return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    if _session_factory is None:
+        _session_factory = sessionmaker(
+            bind=get_engine(), autoflush=False, expire_on_commit=False
+        )
+    return _session_factory
+
+
+def reset_database_state() -> None:
+    """Dispose cached state for isolated tests and controlled process shutdown."""
+    global _engine, _session_factory
+    if _engine is not None:
+        _engine.dispose()
+    _engine = None
+    _session_factory = None
+
+
 def get_db() -> Generator[Session, None, None]:
-    session = create_session_factory()()
+    session = get_session_factory()()
     try:
         yield session
     finally:
