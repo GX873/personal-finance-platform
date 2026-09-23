@@ -11,5 +11,6 @@ data/
 *.db
 .pytest-tmp/
 .tmp-review-*/
+.tmp-task*/
 .env
 .venv/

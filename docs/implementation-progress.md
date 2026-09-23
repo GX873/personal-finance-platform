@@ -4,11 +4,11 @@ Updated: 2026-09-23
 
 - [x] Task 1: Bootstrap, health route, settings, tests; reviewed and committed.
 - [x] Task 2: Database foundation, frozen migrations, UTC persistence; reviewed, 21 tests passing at a626612.
-- [ ] Task 3: Authentication and CSRF; implementation running.
-- [ ] Task 4: Monthly cash buckets.
-- [ ] Task 5: Transactions, reversals and holdings.
-- [ ] Task 6: Valuations, freshness and risk rules.
-- [ ] Task 7: Responsive dashboard and local preview.
+- [x] Task 3: Authentication and CSRF, password-change session revocation, reviewed at 0761d74.
+- [x] Task 4: Monthly cash buckets, caller-owned atomic transactions and duplicate protection, reviewed at 6cf6af7.
+- [x] Task 5: Transactions, reversals, cash/basis replay and holding cache; reviewed at ed3e776.
+- [x] Task 6: Valuations, freshness and risk rules; reviewed at ac0fa75 (89 tests).
+- [ ] Task 7: Responsive dashboard and local preview; implementation running.
 - [ ] Task 8: Manual entry and audit actions.
 - [ ] Task 9: CSV/XLSX and OCR candidate imports.
 - [ ] Task 10: Fund NAV integration.
