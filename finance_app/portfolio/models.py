@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     ForeignKey,
@@ -28,6 +29,10 @@ class AllocationTarget(Base):
         CheckConstraint(
             "upper_bps IS NULL OR upper_bps BETWEEN 0 AND 10000",
             name="ck_allocation_targets_upper_bps",
+        ),
+        CheckConstraint(
+            "upper_bps IS NULL OR target_bps <= upper_bps",
+            name="ck_allocation_targets_order",
         ),
     )
 
@@ -76,7 +81,12 @@ class PortfolioSnapshot(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
-    total_value_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    total_value_cents: Mapped[int | None] = mapped_column(BigInteger)
+    known_value_cents: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+    data_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    details_json: Mapped[str | None] = mapped_column(Text)
     invested_value_cents: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0
     )

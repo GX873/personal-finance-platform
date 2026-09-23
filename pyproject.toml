@@ -21,6 +21,7 @@ dependencies = [
     "openpyxl",
     "Pillow",
     "pytesseract",
+    "tzdata",
 ]
 
 [project.optional-dependencies]
