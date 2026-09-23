@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}数据导入{% endblock %}
+{% block eyebrow %}IMPORTS{% endblock %}
+{% block heading %}导入并核对持仓{% endblock %}
+{% block subtitle %}文件只会先进入私有暂存区；确认前不会写入账本。{% endblock %}
+{% block content %}
+<section class="form-card">
+  {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+  {% if not preview %}
+  <form method="post" action="/imports/preview" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="file">CSV、XLSX 或截图（PNG/JPG/JPEG，最大 10 MiB）</label>
+    <input id="file" name="file" type="file" accept=".csv,.xlsx,.png,.jpg,.jpeg" required>
+    <button type="submit">生成预览</button>
+  </form>
+  {% else %}
+  <p class="eyebrow">源文件：{{ preview.filename }} · SHA-256：{{ preview.sha256 }}</p>
+  {% if preview.get("requires_confirmation") %}<p role="status">This OCR result requires confirmation / OCR 候选项须人工确认。请核对并编辑所有字段；确认前不会写入任何交易。</p>{% endif %}
+  {% if preview.source_text %}<details open><summary>源文本</summary><pre>{{ preview.source_text }}</pre></details>{% endif %}
+  <form method="post" action="/imports/confirm">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="sha256" value="{{ preview.sha256 }}">
+    <label for="account_id">入账账户</label>
+    <select id="account_id" name="account_id" required>{% for account in accounts|default([]) %}<option value="{{ account.id }}">{{ account.name }}</option>{% endfor %}</select>
+    {% for row in preview.rows %}{% set i = loop.index0 %}
+    <fieldset class="import-row"><legend>第 {{ i + 1 }} 行{% if row.confidence is not none %} · OCR 置信度 {{ "%.1f"|format(row.confidence) }}%{% endif %}</legend>
+      {% for key, label in [("asset_code","基金代码"),("asset_name","基金名称"),("quantity","份额"),("cost","持仓成本"),("market_value","当前市值"),("available_cash","可用现金"),("date","日期")] %}
+      <label>{{ label }}<input name="rows-{{ i }}-{{ key }}" value="{{ row.form_values()[key] }}"></label>
+      {% endfor %}
+      {% if row.errors %}<ul class="validation-errors">{% for item in row.errors %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+      <small>原始文本：{{ row.source_text }}</small>
+    </fieldset>
+    {% endfor %}
+    <button type="submit">确认并写入账本</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

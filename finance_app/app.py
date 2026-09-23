@@ -6,6 +6,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from finance_app.auth.routes import router as auth_router
 from finance_app.config import get_settings
+from finance_app.imports.routes import router as imports_router
 from finance_app.web.routes import router as web_router
 
 VERSION = "0.1.0"
@@ -22,6 +23,7 @@ def create_app() -> FastAPI:
         https_only=settings.session_https_only,
     )
     app.include_router(auth_router)
+    app.include_router(imports_router)
     app.include_router(web_router)
     app.mount(
         "/static",

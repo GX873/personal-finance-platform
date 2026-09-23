@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     session_https_only: bool = False
     environment: Literal["development", "production"] = "development"
     demo_mode: bool = False
+    import_upload_dir: str = "./data/imports"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="FINANCE_")
 
