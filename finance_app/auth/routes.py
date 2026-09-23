@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from finance_app.auth.service import (
     authenticate,
@@ -37,7 +38,7 @@ async def login(request: Request, db: Annotated[Session, Depends(get_db)]):
     form = await request.form()
     username, password = form.get("username"), form.get("password")
     user = (
-        authenticate(db, username, password)
+        await run_in_threadpool(authenticate, db, username, password)
         if isinstance(username, str) and isinstance(password, str)
         else None
     )

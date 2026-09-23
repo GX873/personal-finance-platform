@@ -185,3 +185,23 @@ def test_password_change_revokes_existing_session(client, db_session, monkeypatc
     monkeypatch.setattr("finance_app.cli.getpass", lambda _: "replacement-password")
     assert main(["change-password", "--username", "admin"]) == 0
     assert client.get("/").status_code == 303
+
+
+def test_password_verification_runs_outside_event_loop(client, monkeypatch):
+    import asyncio
+
+    from finance_app.auth import routes
+
+    authenticate = routes.authenticate
+    observed_event_loops = []
+
+    def verify_in_worker(db, username, password):
+        try:
+            observed_event_loops.append(asyncio.get_running_loop())
+        except RuntimeError:
+            observed_event_loops.append(None)
+        return authenticate(db, username, password)
+
+    monkeypatch.setattr(routes, "authenticate", verify_in_worker)
+    assert login(client).status_code == 303
+    assert observed_event_loops == [None]
