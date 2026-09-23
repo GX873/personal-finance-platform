@@ -296,6 +296,31 @@ def test_confirm_without_a_preview_writes_nothing(
     assert db_session.scalar(select(ImportBatch)) is None
 
 
+@pytest.mark.parametrize("digest", [None, "not-a-sha256"])
+def test_confirm_invalid_or_missing_hash_shows_upload_form(
+    client: TestClient, db_session, digest: str | None
+) -> None:
+    login(client)
+    account_id = db_session.scalar(select(Account.id))
+    data = confirmation_data("a" * 64, account_id)
+    if digest is None:
+        data.pop("sha256")
+    else:
+        data["sha256"] = digest
+    data["csrf_token"] = csrf(client, "/imports")
+
+    response = client.post("/imports/confirm", data=data)
+
+    assert response.status_code == 422
+    assert "invalid import hash" in response.text
+    assert 'action="/imports/preview"' in response.text
+    assert 'type="file"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
+    db_session.expire_all()
+    assert db_session.scalar(select(Transaction)) is None
+    assert db_session.scalar(select(ImportBatch)) is None
+
+
 def test_confirm_is_csrf_protected_uses_prg_audits_and_never_fabricates_price(
     client: TestClient, db_session, tmp_path: Path
 ) -> None:

@@ -286,9 +286,7 @@ async def confirm_import(
     digest = form.get("sha256")
     account_value = form.get("account_id")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-        return _preview_context(
-            request, user, {"rows": []}, error="invalid import hash"
-        )
+        return _preview_context(request, user, None, error="invalid import hash")
     loaded_preview = _load_session_preview(request)
     if loaded_preview is None or loaded_preview[1]["sha256"] != digest:
         return _preview_context(
