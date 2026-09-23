@@ -33,6 +33,11 @@ class BudgetRule:
             validate_cents(getattr(self, f"{kind.value}_cents"))
 
 
+def default_budget_rule() -> BudgetRule:
+    """Return the default allocation for a 4000 yuan monthly salary."""
+    return BudgetRule()
+
+
 def allocate_salary(salary_cents: int, rule: BudgetRule) -> dict[BucketKind, int]:
     """Allocate a salary exactly; never borrow from reserve to fill a shortfall."""
     validate_cents(salary_cents)

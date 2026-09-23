@@ -14,6 +14,7 @@ from finance_app.ledger.budget import (
     BudgetMismatch,
     BudgetRule,
     allocate_salary,
+    default_budget_rule,
     investable_cents,
 )
 from finance_app.ledger.models import CashBucket, MonthlyBudget, Transaction
@@ -34,7 +35,7 @@ def session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Session
 
 
 def test_default_allocation_and_confirmed_investment():
-    allocation = allocate_salary(400000, BudgetRule())
+    allocation = allocate_salary(400000, default_budget_rule())
     assert allocation == {
         "fixed_expense": 270000,
         "reserve": 100000,
