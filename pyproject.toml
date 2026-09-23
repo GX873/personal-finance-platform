@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-finance"
+version = "0.1.0"
+description = "A single-user personal finance platform"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy",
+    "alembic",
+    "jinja2",
+    "python-multipart",
+    "pydantic-settings",
+    "argon2-cffi",
+    "itsdangerous",
+    "httpx",
+    "openpyxl",
+    "Pillow",
+    "pytesseract",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["finance_app*"]
