@@ -294,7 +294,7 @@ async def confirm_import(
         return _preview_context(
             request,
             user,
-            {"rows": []},
+            None,
             error="import confirmation does not match the latest preview",
         )
     preview_id, preview_state = loaded_preview

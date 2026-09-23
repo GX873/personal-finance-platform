@@ -145,11 +145,15 @@ def load_preview_metadata(directory: Path, preview_id: str) -> PreviewMetadata:
     try:
         with path.open("rb") as stream:
             payload = stream.read(MAX_PREVIEW_METADATA_BYTES + 1)
-        if len(payload) > MAX_PREVIEW_METADATA_BYTES:
-            raise PreviewMetadataError("preview metadata is too large")
-        return _validate_metadata(json.loads(payload.decode("utf-8")))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except OSError as exc:
         raise PreviewMetadataError("preview metadata is unavailable") from exc
+    if len(payload) > MAX_PREVIEW_METADATA_BYTES:
+        raise PreviewMetadataError("preview metadata is too large")
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise PreviewMetadataError("preview metadata is unavailable") from exc
+    return _validate_metadata(decoded)
 
 
 def delete_preview_metadata(directory: Path, preview_id: str) -> None:

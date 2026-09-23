@@ -49,6 +49,30 @@ def test_deeply_nested_corrupt_metadata_is_rejected_safely(tmp_path: Path) -> No
         preview_store.load_preview_metadata(tmp_path, preview_id)
 
 
+def test_integer_limit_json_value_error_is_rejected_safely(tmp_path: Path) -> None:
+    preview_id = "A" * 43
+    payload = '{"oversized_integer":' + "9" * 5_000 + "}"
+    (tmp_path / f"{preview_id}.json").write_text(payload, encoding="utf-8")
+
+    with pytest.raises(PreviewMetadataError, match="unavailable"):
+        preview_store.load_preview_metadata(tmp_path, preview_id)
+
+
+def test_unexpected_memory_error_is_not_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preview_id = "A" * 43
+    (tmp_path / f"{preview_id}.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        preview_store.json,
+        "loads",
+        lambda _: (_ for _ in ()).throw(MemoryError("out of memory")),
+    )
+
+    with pytest.raises(MemoryError, match="out of memory"):
+        preview_store.load_preview_metadata(tmp_path, preview_id)
+
+
 def test_preview_id_collision_never_overwrites_existing_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -186,7 +186,9 @@ def test_new_preview_removes_previous_server_metadata(
     assert not first_metadata.exists()
 
 
-@pytest.mark.parametrize("failure", ["missing", "corrupt", "digest-mismatch"])
+@pytest.mark.parametrize(
+    "failure", ["missing", "corrupt", "digest-mismatch", "integer-limit"]
+)
 def test_confirm_rejects_untrusted_server_metadata_without_writes(
     client: TestClient, db_session, tmp_path: Path, failure: str
 ) -> None:
@@ -201,6 +203,10 @@ def test_confirm_rejects_untrusted_server_metadata_without_writes(
         metadata_file.unlink()
     elif failure == "corrupt":
         metadata_file.write_text("{not-json", encoding="utf-8")
+    elif failure == "integer-limit":
+        metadata_file.write_text(
+            '{"oversized_integer":' + "9" * 5_000 + "}", encoding="utf-8"
+        )
     else:
         metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
         metadata["sha256"] = "f" * 64
@@ -209,9 +215,19 @@ def test_confirm_rejects_untrusted_server_metadata_without_writes(
     data = confirmation_data(digest, account_id)
     data["csrf_token"] = csrf(client, "/imports")
 
-    response = client.post("/imports/confirm", data=data)
+    if failure == "integer-limit":
+        with TestClient(
+            client.app, follow_redirects=False, raise_server_exceptions=False
+        ) as error_client:
+            error_client.cookies.update(client.cookies)
+            response = error_client.post("/imports/confirm", data=data)
+    else:
+        response = client.post("/imports/confirm", data=data)
 
     assert response.status_code == 422
+    assert 'action="/imports/preview"' in response.text
+    assert 'type="file"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
     assert str(metadata_file.parent) not in response.text
     db_session.expire_all()
     assert db_session.scalars(select(Transaction)).all() == []
@@ -253,6 +269,9 @@ def test_confirm_requires_the_hash_from_the_latest_preview(
     response = client.post("/imports/confirm", data=data)
 
     assert response.status_code == 422
+    assert 'action="/imports/preview"' in response.text
+    assert 'type="file"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
     db_session.expire_all()
     assert db_session.scalar(select(Transaction)) is None
     assert db_session.scalar(select(ImportBatch)) is None
@@ -269,6 +288,9 @@ def test_confirm_without_a_preview_writes_nothing(
     response = client.post("/imports/confirm", data=data)
 
     assert response.status_code == 422
+    assert 'action="/imports/preview"' in response.text
+    assert 'type="file"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
     db_session.expire_all()
     assert db_session.scalar(select(Transaction)) is None
     assert db_session.scalar(select(ImportBatch)) is None
