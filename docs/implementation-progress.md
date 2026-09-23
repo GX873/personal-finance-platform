@@ -9,7 +9,7 @@ Updated: 2026-09-23
 - [x] Task 5: Transactions, reversals, cash/basis replay and holding cache; reviewed at ed3e776.
 - [x] Task 6: Valuations, freshness and risk rules; reviewed at ac0fa75 (89 tests).
 - [x] Task 7: Responsive dashboard and local preview; reviewed at 1e3dbf1 (102 tests).
-- [ ] Task 8: Manual entry and audit actions; implementation running.
+- [x] Task 8: Manual entry, reversals, price entry and audited form actions; reviewed at 4d0f8f8 (152 tests).
 - [ ] Task 9: CSV/XLSX and OCR candidate imports.
 - [ ] Task 10: Fund NAV integration.
 - [ ] Task 11: Email and WeChat notifications.
