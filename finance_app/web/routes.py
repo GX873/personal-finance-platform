@@ -32,7 +32,7 @@ def page(request: Request, db: Annotated[Session, Depends(get_db)]):
             "csrf_token": csrf_token(request),
             "section": section,
             "demo": False,
-            "vm": dashboard(db),
+            "vm": dashboard(db, section=section),
         },
     )
 

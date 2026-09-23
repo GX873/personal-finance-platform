@@ -1,9 +1,10 @@
 """Read-only dashboard data; missing observations never become zero balances."""
 
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from finance_app.db import utc_now
@@ -15,7 +16,7 @@ from finance_app.portfolio.models import (
     PortfolioSnapshot,
     PriceSnapshot,
 )
-from finance_app.portfolio.rules import SHANGHAI, nav_is_fresh
+from finance_app.portfolio.rules import SHANGHAI, expected_nav_date, nav_is_fresh
 from finance_app.portfolio.service import value_cents
 
 
@@ -23,22 +24,62 @@ def money(cents: int | None) -> str:
     return "待确认" if cents is None else f"{Decimal(cents) / 100:,.2f}"
 
 
-def dashboard(db: Session | None = None) -> dict:
+def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
     now = utc_now()
     today = now.astimezone(SHANGHAI).date()
+    if section == "alerts":
+        return {
+            "today": today.isoformat(),
+            "alerts": list(
+                db.scalars(
+                    select(Alert)
+                    .order_by(Alert.created_at.desc(), Alert.id.desc())
+                    .limit(100)
+                )
+            )
+            if db
+            else [],
+        }
     snapshots = (
         list(
             db.scalars(
                 select(PortfolioSnapshot)
-                .where(PortfolioSnapshot.snapshot_date <= today)
+                .where(
+                    PortfolioSnapshot.snapshot_date <= today,
+                    PortfolioSnapshot.snapshot_date >= today - timedelta(days=6),
+                )
                 .order_by(PortfolioSnapshot.snapshot_date.desc())
+                .limit(7)
             )
         )
-        if db
+        if db and section == "dashboard"
         else []
     )
-    latest = snapshots[0] if snapshots else None
-    buckets = list(db.scalars(select(CashBucket))) if db else []
+    latest = (
+        (
+            snapshots[0]
+            if snapshots
+            else db.scalar(
+                select(PortfolioSnapshot)
+                .where(PortfolioSnapshot.snapshot_date <= today)
+                .order_by(PortfolioSnapshot.snapshot_date.desc())
+                .limit(1)
+            )
+        )
+        if db and section == "dashboard"
+        else None
+    )
+    buckets = (
+        list(
+            db.scalars(
+                select(CashBucket).where(
+                    CashBucket.bucket_kind.in_(("reserve", "investment"))
+                )
+            )
+        )
+        if db and section == "dashboard"
+        else []
+    )
     balances = {}
     balance_dates = {}
     for kind in ("reserve", "investment"):
@@ -61,30 +102,24 @@ def dashboard(db: Session | None = None) -> dict:
             .where(Holding.quantity > 0)
             .order_by(Holding.id)
         ):
-            prices = db.scalars(
+            price = db.scalar(
                 select(PriceSnapshot)
                 .where(
                     PriceSnapshot.asset_id == asset.id,
                     PriceSnapshot.valuation_date <= today,
                     PriceSnapshot.fetched_at <= now,
                     PriceSnapshot.error_text.is_(None),
+                    PriceSnapshot.price > 0,
+                    func.length(func.trim(PriceSnapshot.source)) > 0,
+                    PriceSnapshot.valuation_date
+                    <= func.date(PriceSnapshot.fetched_at, "+8 hours"),
                 )
                 .order_by(
                     PriceSnapshot.valuation_date.desc(),
                     PriceSnapshot.fetched_at.desc(),
                     PriceSnapshot.id.desc(),
                 )
-            )
-            price = next(
-                (
-                    p
-                    for p in prices
-                    if p.price.is_finite()
-                    and p.price > 0
-                    and p.source.strip()
-                    and p.valuation_date <= p.fetched_at.astimezone(SHANGHAI).date()
-                ),
-                None,
+                .limit(1)
             )
             amount = (
                 value_cents(holding.quantity, price.price)
@@ -115,8 +150,11 @@ def dashboard(db: Session | None = None) -> dict:
                         and nav_is_fresh(price.valuation_date, price.fetched_at, now)
                     ),
                     "priced": amount is not None,
+                    "updated_at": holding.updated_at,
                 }
             )
+    if section == "holdings":
+        return {"today": today.isoformat(), "holdings": holdings}
     series = {
         row.snapshot_date: row.total_value_cents
         for row in snapshots
@@ -149,13 +187,50 @@ def dashboard(db: Session | None = None) -> dict:
         if db
         else []
     )
+    complete = bool(
+        latest and latest.data_complete and latest.total_value_cents is not None
+    )
+    # A complete historical valuation alone cannot certify today's data.
+    fresh = False
+    if complete and latest and latest.details_json:
+        try:
+            details = json.loads(latest.details_json)
+            as_of = datetime.fromisoformat(details["as_of"])
+            fresh = bool(
+                as_of.utcoffset() is not None
+                and as_of <= now
+                and as_of.astimezone(SHANGHAI).date() >= expected_nav_date(now)
+                and all(
+                    details.get(key) is True
+                    for key in ("holdings_fresh", "cash_fresh", "currency_supported")
+                )
+                and all(
+                    balances[kind] is not None for kind in ("reserve", "investment")
+                )
+                and all(
+                    expected_nav_date(now) <= row.updated_at.astimezone(SHANGHAI).date()
+                    and row.updated_at <= as_of
+                    for row in buckets
+                )
+                and all(
+                    h["fresh"] and h["priced"] and h["updated_at"] <= as_of
+                    for h in holdings
+                )
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            fresh = False
     return {
         "today": today.isoformat(),
         "total": money(latest.total_value_cents)
         if latest and latest.data_complete and latest.total_value_cents is not None
         else "未确认",
         "snapshot_date": latest.snapshot_date.isoformat() if latest else "尚无快照",
-        "known": money(latest.known_value_cents) if latest else None,
+        "known": money(latest.known_value_cents) if latest and not complete else None,
+        "freshness_label": "数据有效"
+        if fresh
+        else "数据待更新"
+        if complete
+        else "数据待完善",
         "reserve": money(balances["reserve"]),
         "investment": money(balances["investment"]),
         "reserve_date": balance_dates["reserve"],
@@ -187,6 +262,12 @@ def dashboard(db: Session | None = None) -> dict:
         )
         if db
         else [],
-        "advice_action": "WAIT_FOR_DATA",
-        "advice_reason": "尚未完成适用配置与数据的联合确认。请先确认现金、持仓、净值与投资配置，再评估操作。",
+        "advice_action": "HOLD" if fresh else "WAIT_FOR_DATA",
+        "advice_heading": "数据已就绪，先确认投资配置。"
+        if fresh
+        else "先把数据补齐，再做决定。",
+        "advice_status": "待配置" if fresh else "等待确认",
+        "advice_reason": "现金、持仓与净值数据有效。风险偏好、适用配置与本月剩余额度尚未联合确认，暂不建议新增操作。"
+        if fresh
+        else "请先补齐或更新现金、持仓与净值，并确认数据来源和日期，再评估操作。",
     }
