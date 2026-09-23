@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
@@ -8,7 +9,11 @@ from decimal import Decimal, InvalidOperation
 import httpx
 
 from finance_app.db import utc_now
-from finance_app.market.base import FundNavQuote, MarketDataError
+from finance_app.market.base import (
+    FundNavQuote,
+    MarketDataError,
+    validate_storable_nav,
+)
 
 EASTMONEY_NAV_URL = "https://api.fund.eastmoney.com/f10/lsjz"
 EASTMONEY_REFERER = "https://fundf10.eastmoney.com/"
@@ -49,12 +54,44 @@ class EastMoneyFundNavProvider:
 
         for attempt in range(1, TOTAL_ATTEMPTS + 1):
             try:
-                response = self._client.get(
+                with self._client.stream(
+                    "GET",
                     self.source_url,
                     params=params,
                     headers=headers,
                     timeout=self._timeout,
-                )
+                ) as response:
+                    response_url = str(response.request.url)
+                    if response.status_code != httpx.codes.OK:
+                        retryable = (
+                            response.status_code == 429 or response.status_code >= 500
+                        )
+                        if retryable and attempt < TOTAL_ATTEMPTS:
+                            continue
+                        raise self._error(
+                            "upstream_http",
+                            response_url,
+                            attempt,
+                            "upstream_http: eastmoney returned "
+                            f"HTTP {response.status_code}",
+                        )
+
+                    try:
+                        content = self._read_response(response)
+                        quote_date, value = self._parse_response(content)
+                    except (
+                        httpx.DecodingError,
+                        ValueError,
+                        TypeError,
+                        InvalidOperation,
+                    ):
+                        raise self._error(
+                            "invalid_response",
+                            response_url,
+                            attempt,
+                            "invalid_response: eastmoney returned an invalid "
+                            "daily NAV payload",
+                        ) from None
             except httpx.TimeoutException:
                 if attempt < TOTAL_ATTEMPTS:
                     continue
@@ -73,42 +110,27 @@ class EastMoneyFundNavProvider:
                     attempt,
                     f"upstream_network: eastmoney request failed after {attempt} attempts",
                 ) from None
-
-            if response.status_code != httpx.codes.OK:
-                retryable = response.status_code == 429 or response.status_code >= 500
-                if retryable and attempt < TOTAL_ATTEMPTS:
-                    continue
-                raise self._error(
-                    "upstream_http",
-                    str(response.request.url),
-                    attempt,
-                    f"upstream_http: eastmoney returned HTTP {response.status_code}",
-                )
-
-            try:
-                quote_date, value = self._parse_response(response)
-            except (ValueError, TypeError, InvalidOperation):
-                raise self._error(
-                    "invalid_response",
-                    str(response.request.url),
-                    attempt,
-                    "invalid_response: eastmoney returned an invalid daily NAV payload",
-                ) from None
             return FundNavQuote(
                 value=value,
                 valuation_date=quote_date,
                 source=self.source,
-                source_url=str(response.request.url),
+                source_url=response_url,
                 fetched_at=self._clock(),
                 attempts=attempt,
             )
 
         raise AssertionError("bounded retry loop exited unexpectedly")
 
-    def _parse_response(self, response: httpx.Response) -> tuple[date, Decimal]:
-        if len(response.content) > MAX_RESPONSE_BYTES:
-            raise ValueError("response exceeds size limit")
-        payload = response.json()
+    def _read_response(self, response: httpx.Response) -> bytes:
+        content = bytearray()
+        for chunk in response.iter_bytes():
+            if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
+                raise ValueError("response exceeds size limit")
+            content.extend(chunk)
+        return bytes(content)
+
+    def _parse_response(self, content: bytes) -> tuple[date, Decimal]:
+        payload = json.loads(content)
         if not isinstance(payload, Mapping):
             raise TypeError("response must be an object")
         data = payload.get("Data")
@@ -127,8 +149,7 @@ class EastMoneyFundNavProvider:
         if not isinstance(raw_value, str) or _NAV.fullmatch(raw_value) is None:
             raise ValueError("DWJZ must be a decimal string")
         value = Decimal(raw_value)
-        if not value.is_finite() or value <= 0:
-            raise ValueError("DWJZ must be finite and positive")
+        validate_storable_nav(value)
         return quote_date, value
 
     def _error(

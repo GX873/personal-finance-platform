@@ -6,6 +6,24 @@ from decimal import Decimal
 from typing import Protocol
 
 
+def validate_storable_nav(value: Decimal) -> None:
+    """Require an exact positive value within Numeric(24, 8)."""
+    if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+        raise ValueError("NAV must be a finite positive Decimal")
+    digits = list(value.as_tuple().digits)
+    exponent_value = value.as_tuple().exponent
+    if not isinstance(exponent_value, int):
+        raise TypeError("finite NAV exponent must be an integer")
+    exponent = exponent_value
+    while digits and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    fractional_digits = max(-exponent, 0)
+    integer_digits = max(len(digits) + exponent, 0)
+    if fractional_digits > 8 or integer_digits > 16:
+        raise ValueError("NAV must be exactly representable as Numeric(24, 8)")
+
+
 @dataclass(frozen=True)
 class FundNavQuote:
     value: Decimal
@@ -16,12 +34,7 @@ class FundNavQuote:
     attempts: int = 1
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.value, Decimal)
-            or not self.value.is_finite()
-            or self.value <= 0
-        ):
-            raise ValueError("NAV must be a finite positive Decimal")
+        validate_storable_nav(self.value)
         if type(self.valuation_date) is not date:
             raise ValueError("valuation date must be a date")
         if not isinstance(self.source, str) or not self.source.strip():

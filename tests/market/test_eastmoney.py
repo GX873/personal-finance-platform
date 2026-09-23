@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -7,7 +8,7 @@ import httpx
 import pytest
 
 from finance_app.market.base import MarketDataError
-from finance_app.market.eastmoney import EastMoneyFundNavProvider
+from finance_app.market.eastmoney import MAX_RESPONSE_BYTES, EastMoneyFundNavProvider
 
 NOW = datetime(2026, 9, 23, 1, 2, 3, tzinfo=UTC)
 
@@ -15,6 +16,21 @@ NOW = datetime(2026, 9, 23, 1, 2, 3, tzinfo=UTC)
 def provider(handler) -> EastMoneyFundNavProvider:
     client = httpx.Client(transport=httpx.MockTransport(handler))
     return EastMoneyFundNavProvider(client=client, clock=lambda: NOW)
+
+
+class CountingStream(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.chunks_read = 0
+        self.closed = False
+
+    def __iter__(self):
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_eastmoney_maps_daily_nav_and_request_provenance():
@@ -153,3 +169,26 @@ def test_http_error_summary_does_not_echo_response_body_and_retries_5xx():
     assert caught.value.code == "upstream_http"
     assert "503" in caught.value.summary
     assert "do-not-leak" not in caught.value.summary
+
+
+def test_decompressed_size_limit_closes_stream_without_consuming_later_chunks():
+    stream = CountingStream(
+        [
+            gzip.compress(b"x" * (MAX_RESPONSE_BYTES + 1)),
+            gzip.compress(b"must-not-be-consumed"),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=stream,
+        )
+
+    with pytest.raises(MarketDataError) as caught:
+        provider(handler).fetch("000001")
+
+    assert caught.value.code == "invalid_response"
+    assert stream.chunks_read == 1
+    assert stream.closed is True

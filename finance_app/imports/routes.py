@@ -337,7 +337,12 @@ async def confirm_import(
                 select(Asset).where(Asset.code == row.asset_code, Asset.market == "CN")
             )
             if asset is None:
-                asset = Asset(code=row.asset_code, market="CN", name=row.asset_name)
+                asset = Asset(
+                    code=row.asset_code,
+                    market="CN",
+                    name=row.asset_name,
+                    asset_class="fund",
+                )
                 db.add(asset)
                 db.flush()
             post_transaction(

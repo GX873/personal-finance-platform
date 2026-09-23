@@ -6,6 +6,8 @@ import hashlib
 import json
 import re
 from collections.abc import Iterator
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,8 @@ from finance_app.app import create_app
 from finance_app.auth.models import User
 from finance_app.imports.parser import ImportFileError
 from finance_app.ledger.models import Account, Asset, AuditEvent, Transaction
+from finance_app.market.base import FundNavQuote
+from finance_app.market.service import FundPriceService, RefreshStatus
 from finance_app.notifications.models import ImportBatch
 from tests.test_database import db_session as database_session_fixture
 
@@ -360,7 +364,32 @@ def test_confirm_is_csrf_protected_uses_prg_audits_and_never_fabricates_price(
     assert transaction.amount_cents == 2_000
     assert transaction.price is None
     assert transaction.quantity == 2
-    assert db_session.scalar(select(Asset).where(Asset.code == "000001")) is not None
+    asset = db_session.scalar(select(Asset).where(Asset.code == "000001"))
+    assert asset is not None
+    assert asset.asset_class == "fund"
+
+    fetched_at = datetime(2026, 9, 23, tzinfo=UTC)
+
+    class ImportedFundProvider:
+        source = "eastmoney"
+        source_url = "https://api.fund.eastmoney.com/f10/lsjz"
+
+        def fetch(self, fund_code: str) -> FundNavQuote:
+            assert fund_code == "000001"
+            return FundNavQuote(
+                value=Decimal("1.2345"),
+                valuation_date=date(2026, 9, 22),
+                source=self.source,
+                source_url=self.source_url,
+                fetched_at=fetched_at,
+            )
+
+    refresh = FundPriceService(
+        db_session, ImportedFundProvider(), clock=lambda: fetched_at
+    ).refresh("000001")
+    assert refresh.status is RefreshStatus.SUCCESS
+    assert refresh.snapshot is not None
+    assert refresh.snapshot.asset_id == asset.id
     batch = db_session.scalar(select(ImportBatch).where(ImportBatch.sha256 == digest))
     assert batch is not None
     assert batch.filename == digest

@@ -4,12 +4,15 @@ import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
+import httpx
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from finance_app.db import Base, create_db_engine
 from finance_app.ledger.models import Asset, AuditEvent
 from finance_app.market.base import FundNavQuote, MarketDataError
+from finance_app.market.eastmoney import EastMoneyFundNavProvider
 from finance_app.market.service import FundPriceService, RefreshStatus
 from finance_app.portfolio.models import PriceSnapshot
 
@@ -207,6 +210,96 @@ def test_refresh_is_idempotent_for_same_source_and_valuation_date():
         assert session.scalar(select(func.count()).select_from(PriceSnapshot)) == 1
     finally:
         session.close()
+
+
+def test_valid_eight_decimal_nav_survives_commit_expire_and_new_session():
+    session, asset = setup_session()
+    engine = session.get_bind()
+    try:
+        exact_quote = FundNavQuote(
+            value=Decimal("1.23456789"),
+            valuation_date=date(2026, 9, 22),
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            fetched_at=NOW,
+        )
+        result = FundPriceService(
+            session, StubProvider(exact_quote), clock=lambda: NOW
+        ).refresh("000001")
+        assert result.status is RefreshStatus.SUCCESS
+        session.commit()
+        session.expire_all()
+        assert session.scalar(select(PriceSnapshot.price)) == Decimal("1.23456789")
+        asset_id = asset.id
+    finally:
+        session.close()
+
+    with Session(engine) as reloaded:
+        snapshot = reloaded.scalar(
+            select(PriceSnapshot).where(PriceSnapshot.asset_id == asset_id)
+        )
+        assert snapshot is not None
+        assert snapshot.price == Decimal("1.23456789")
+
+
+@pytest.mark.parametrize("raw_nav", ["0.000000001", "10000000000000000"])
+def test_unrepresentable_nav_fails_without_replacing_last_good(raw_nav: str):
+    session, asset = setup_session()
+    engine = session.get_bind()
+    try:
+        original = PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=date(2026, 9, 19),
+            price=Decimal("1.20000000"),
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            fetched_at=datetime(2026, 9, 20, tzinfo=UTC),
+        )
+        session.add(original)
+        session.flush()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "Data": {
+                        "LSJZList": [{"FSRQ": "2026-09-22", "DWJZ": raw_nav}]
+                    }
+                },
+            )
+
+        provider = EastMoneyFundNavProvider(
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+            clock=lambda: NOW,
+        )
+        result = FundPriceService(session, provider, clock=lambda: NOW).refresh(
+            "000001"
+        )
+
+        assert result.status is RefreshStatus.FAILED
+        assert result.last_good_price == Decimal("1.20000000")
+        assert result.snapshot is None
+        assert result.error_summary is not None
+        assert "invalid_response" in result.error_summary
+        assert session.scalar(select(func.count()).select_from(PriceSnapshot)) == 1
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == "market_price_refresh_failed"
+            )
+        )
+        assert audit is not None
+        assert json.loads(audit.details_json or "")["error_code"] == "invalid_response"
+        session.commit()
+        asset_id = asset.id
+    finally:
+        session.close()
+
+    with Session(engine) as reloaded:
+        persisted = reloaded.scalar(
+            select(PriceSnapshot).where(PriceSnapshot.asset_id == asset_id)
+        )
+        assert persisted is not None
+        assert persisted.price == Decimal("1.20000000")
 
 
 def test_non_fund_asset_is_not_fetched_or_modified():
