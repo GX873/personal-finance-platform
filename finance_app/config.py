@@ -11,11 +11,14 @@ class Settings(BaseSettings):
     timezone: str = "Asia/Shanghai"
     session_https_only: bool = False
     environment: Literal["development", "production"] = "development"
+    demo_mode: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="FINANCE_")
 
     @model_validator(mode="after")
     def validate_production_secret(self) -> "Settings":
+        if self.environment == "production" and self.demo_mode:
+            raise ValueError("Production does not allow demo_mode")
         if self.environment == "production" and (
             self.secret_key == "development-only-change-me" or len(self.secret_key) < 32
         ):

@@ -10,7 +10,6 @@ from starlette.concurrency import run_in_threadpool
 from finance_app.auth.service import (
     authenticate,
     csrf_token,
-    current_user,
     require_csrf,
     session_fingerprint,
 )
@@ -58,18 +57,6 @@ async def login(request: Request, db: Annotated[Session, Depends(get_db)]):
     request.session["auth_fingerprint"] = session_fingerprint(user)
     csrf_token(request)
     return RedirectResponse("/", status_code=303)
-
-
-@router.get("/", response_class=HTMLResponse)
-def home(request: Request, db: Annotated[Session, Depends(get_db)]):
-    user = current_user(request, db)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-    return templates.TemplateResponse(
-        request=request,
-        name="home.html",
-        context={"user": user, "csrf_token": csrf_token(request)},
-    )
 
 
 @router.post("/logout", dependencies=[Depends(require_csrf)])

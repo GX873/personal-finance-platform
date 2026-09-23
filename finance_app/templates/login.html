@@ -1,17 +1,16 @@
 <!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in | Personal Finance</title></head>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登录 · 有数</title><link rel="stylesheet" href="/static/app.css"></head>
 <body>
-<main>
-  <h1>Personal Finance</h1>
-  {% if development %}<p>Local development mode</p>{% endif %}
-  {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<main class="login-shell"><section class="login-story"><div class="brand"><span class="brand-mark">有</span><span>有数<small>YOUR MONEY, IN PERSPECTIVE</small></span></div><h1>生活有节奏，<br>钱也有安排。</h1><p>一个属于自己的账本。看清收支，照顾当下，慢慢积累。</p></section><section class="login-card"><p class="eyebrow">WELCOME BACK</p><h2>回到你的账本</h2><p class="hint">私人记录，从这里开始。</p>
+  {% if development %}<p class="hint">本地开发模式</p>{% endif %}
+  {% if error %}<p role="alert">用户名或密码不正确，请重试。</p>{% endif %}
   <form method="post" action="/login">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p><label>Username <input name="username" autocomplete="username" required></label></p>
-    <p><label>Password <input type="password" name="password" autocomplete="current-password" required></label></p>
-    <button type="submit">Sign in</button>
+    <p><label>用户名 <input name="username" autocomplete="username" required></label></p>
+    <p><label>密码 <input type="password" name="password" autocomplete="current-password" required></label></p>
+    <button type="submit">登录账本 ↗</button>
   </form>
-</main>
+</section></main>
 </body>
 </html>
