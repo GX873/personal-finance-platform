@@ -40,7 +40,14 @@ from finance_app.web.forms import (
 from finance_app.web.viewmodels import dashboard, money
 
 router = APIRouter()
+
+
+def shanghai_datetime(value: datetime) -> str:
+    return value.astimezone(SHANGHAI).strftime("%Y-%m-%d %H:%M")
+
+
 templates.env.filters["money"] = money
+templates.env.filters["shanghai_datetime"] = shanghai_datetime
 
 
 def _today() -> str:

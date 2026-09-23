@@ -212,10 +212,7 @@ def _finish(session: Session, row: Transaction, event: str) -> None:
             entity_type="transaction",
             entity_id=row.id,
             details_json=json.dumps(
-                {
-                    "note": row.description,
-                    "reverses_transaction_id": row.reverses_transaction_id,
-                }
+                {"reverses_transaction_id": row.reverses_transaction_id}
             ),
         )
     )

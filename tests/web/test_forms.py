@@ -18,6 +18,7 @@ from finance_app.auth.models import User
 from finance_app.db import create_db_engine, get_session_factory, reset_database_state
 from finance_app.ledger.models import Account, Asset, AuditEvent, Transaction
 from finance_app.portfolio.models import Alert, PriceSnapshot
+from finance_app.web import routes as web_routes
 from finance_app.web.forms import FormError, parse_decimal, parse_yuan
 
 
@@ -250,6 +251,26 @@ def test_post_transaction_uses_manual_uuid_and_beijing_time(client, db_session):
     web_details = json.loads(events[1].details_json)
     assert web_details["actor"]["username"] == "admin"
     assert "定投" not in events[1].details_json
+    service_details = json.loads(events[0].details_json)
+    assert "note" not in service_details
+    assert "定投" not in service_details.values()
+
+    page = client.get("/transactions")
+    assert "2026-09-23 15:30" in page.text
+
+
+def test_transaction_time_formatter_explicitly_uses_shanghai_timezone():
+    timestamp = datetime(2026, 9, 23, 7, 30, tzinfo=UTC)
+
+    assert web_routes.shanghai_datetime(timestamp) == "2026-09-23 15:30"
+
+
+def test_mobile_navigation_links_manual_price_entry(client):
+    assert login(client).status_code == 303
+    page = client.get("/")
+    mobile_nav = page.text.split('class="mobile-nav"', 1)[1].split("</nav>", 1)[0]
+    assert 'href="/prices/new"' in mobile_nav
+    assert "净值" in mobile_nav
 
 
 def test_transaction_failure_rolls_back_service_and_web_audit(client, db_session):
