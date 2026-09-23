@@ -10,3 +10,6 @@ dist/
 data/
 *.db
 .pytest-tmp/
+.tmp-review-*/
+.env
+.venv/
