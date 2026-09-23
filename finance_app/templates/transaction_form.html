@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}手工记账{% endblock %}
+{% block eyebrow %}MANUAL ENTRY{% endblock %}
+{% block heading %}记下真实发生的一笔。{% endblock %}
+{% block subtitle %}北京时间录入；买入前账户中必须已有足够资金。{% endblock %}
+{% block content %}
+<section class="panel form-panel"><div class="section-heading"><h2>新增流水</h2><a class="text-link" href="/accounts">先添加账户或基金 ↗</a></div>
+{% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+<form class="manual-form two-column" method="post" action="/transactions">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>类型<select name="kind">{% for key,label in [('TRANSFER_IN','转入'),('TRANSFER_OUT','转出'),('BUY','买入'),('SELL','卖出'),('DIVIDEND','分红'),('FEE','费用')] %}<option value="{{ key }}" {{ 'selected' if values.get('kind') == key }}>{{ label }}</option>{% endfor %}</select></label>
+  <label>账户<select required name="account_id"><option value="">请选择</option>{% for account in accounts %}<option value="{{ account.id }}" {{ 'selected' if values.get('account_id') == account.id|string }}>{{ account.name }}</option>{% endfor %}</select></label>
+  <label>基金（买卖必选）<select name="asset_id"><option value="">无</option>{% for asset in assets %}<option value="{{ asset.id }}" {{ 'selected' if values.get('asset_id') == asset.id|string }}>{{ asset.code }} · {{ asset.name }}</option>{% endfor %}</select></label>
+  <label>金额（元）<input required inputmode="decimal" name="amount" value="{{ values.get('amount', '') }}"></label>
+  <label>份额<input inputmode="decimal" name="quantity" value="{{ values.get('quantity', '') }}"></label>
+  <label>成交价格（可选）<input inputmode="decimal" name="price" value="{{ values.get('price', '') }}"></label>
+  <label>手续费（元）<input required inputmode="decimal" name="fee" value="{{ values.get('fee', '0') }}"></label>
+  <label>发生时间（北京时间）<input required type="datetime-local" name="occurred_at" value="{{ values.get('occurred_at', local_now) }}"></label>
+  <label class="full">备注<textarea maxlength="1000" name="note">{{ values.get('note', '') }}</textarea></label>
+  <button class="full" type="submit">确认记账</button>
+</form></section>
+{% endblock %}

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}收支流水{% endblock %}
+{% block eyebrow %}LEDGER{% endblock %}
+{% block heading %}每一笔，都有来处。{% endblock %}
+{% block subtitle %}最近 100 笔不可变流水；冲正会追加记录，不覆盖原始事实。{% endblock %}
+{% block content %}
+<section class="panel"><div class="section-heading"><h2>流水记录</h2><a class="primary-link" href="/transactions/new">新增一笔 ＋</a></div>
+{% if transactions %}<div class="table-scroll"><table><thead><tr><th>时间</th><th>类型</th><th>账户 / 基金</th><th>金额</th><th>状态 / 操作</th></tr></thead><tbody>{% for tx in transactions %}<tr><td>{{ tx.occurred_at.astimezone().strftime('%Y-%m-%d %H:%M') }}</td><td>{{ tx.kind }}</td><td>{{ account_names.get(tx.account_id, '未知账户') }}<small>{{ asset_names.get(tx.asset_id, '') }}</small></td><td>¥ {{ tx.amount_cents|money }}<small>手续费 ¥ {{ tx.fee_cents|money }}</small></td><td>{% if tx.reverses_transaction_id %}冲正 #{{ tx.reverses_transaction_id }}{% elif tx.id in reversed_ids %}已冲正{% else %}<form class="inline-form" method="post" action="/transactions/{{ tx.id }}/reversal"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input required maxlength="500" name="reason" aria-label="冲正原因" placeholder="冲正原因"><button type="submit">冲正</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty-holdings"><span class="empty-symbol">⇄</span><div><h3>还没有流水</h3><p>先添加账户，再录入实际发生的转入、买入或费用。</p></div></div>{% endif %}</section>
+{% endblock %}

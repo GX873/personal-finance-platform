@@ -1,1 +1,35 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{% block title %}资产总览{% endblock %} · 有数</title><link rel="stylesheet" href="/static/app.css"><script defer src="/static/app.js"></script></head><body><a class="skip" href="#main">跳到主要内容</a><aside class="sidebar"><a class="brand" href="{{ '/preview' if demo else '/' }}"><span class="brand-mark">有</span><span>有数<small>YOUR MONEY, IN PERSPECTIVE</small></span></a><p class="nav-caption">我的财务 / PERSONAL FINANCE</p><nav aria-label="主要导航">{% for key,label,url,icon in [('dashboard','资产总览','/','◈'),('holdings','我的持仓','/holdings','▤'),('transactions','收支流水',none,'⇄'),('budget','月度预算',none,'▦'),('analysis','投资分析',none,'↗'),('alerts','提醒中心','/alerts','○'),('imports','数据导入',none,'↓'),('settings','偏好设置',none,'⚙')] %}{% if url and not demo %}<a class="nav-item {{ 'active' if section == key }}" href="{{ url }}" {% if section == key %}aria-current="page"{% endif %}><span aria-hidden="true">{{ icon }}</span>{{ label }}</a>{% elif demo and key == 'dashboard' %}<a class="nav-item active" href="/preview" aria-current="page"><span>◈</span>资产总览</a>{% else %}<span class="nav-item unavailable" aria-disabled="true"><span aria-hidden="true">{{ icon }}</span>{{ label }}<small>{{ '登录后' if url else '即将可用' }}</small></span>{% endif %}{% endfor %}</nav><div class="sidebar-note"><span>慢慢积累，认真生活。</span><p>把每一笔钱，放在心里有数的位置。</p><span class="local-dot"></span> 本地私人账本</div>{% if not demo %}<form class="signout" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><span>{{ user.username }}</span><button type="submit">退出登录 ↗</button></form>{% endif %}</aside><main id="main" class="main">{% if demo %}<div class="demo-banner" role="status">演示预览 · 空白账本界面，不读取真实财务数据。<a href="/login">登录自己的账本 ↗</a></div>{% endif %}<header class="page-header"><div><p class="eyebrow">有数 / {% block eyebrow %}OVERVIEW{% endblock %}</p><h1>{% block heading %}看清当下，从容向前。{% endblock %}</h1><p class="subtitle">{% block subtitle %}先照顾好生活，再让积累发生。{% endblock %}</p></div><div class="date-stamp"><span class="local-dot"></span> 本地账本<time datetime="{{ vm.today }}">{{ vm.today.replace('-', ' / ') }}</time></div></header>{% block content %}{% endblock %}<footer>有数 · 每一份确定，都来自真实记录。<span>金额单位：人民币元 · Asia/Shanghai</span></footer></main><nav class="mobile-nav" aria-label="移动导航"><a href="{{ '/preview' if demo else '/' }}" {{ 'aria-current=page' if section == 'dashboard' }}>◈<span>总览</span></a>{% if not demo %}<a href="/holdings" {{ 'aria-current=page' if section == 'holdings' }}>▤<span>持仓</span></a><a href="/alerts" {{ 'aria-current=page' if section == 'alerts' }}>○<span>提醒</span></a>{% else %}<a href="/login">↗<span>登录</span></a>{% endif %}</nav></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}资产总览{% endblock %} · 有数</title>
+  <link rel="stylesheet" href="/static/app.css"><link rel="stylesheet" href="/static/forms.css"><script defer src="/static/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#main">跳到主要内容</a>
+<aside class="sidebar">
+  <a class="brand" href="{{ '/preview' if demo else '/' }}"><span class="brand-mark">有</span><span>有数<small>YOUR MONEY, IN PERSPECTIVE</small></span></a>
+  <p class="nav-caption">我的财务 / PERSONAL FINANCE</p>
+  <nav aria-label="主要导航">
+  {% for key,label,url,icon in [
+    ('dashboard','资产总览','/','◈'),('holdings','我的持仓','/holdings','▤'),
+    ('transactions','收支流水','/transactions','⇄'),('accounts','账户与基金','/accounts','▦'),
+    ('prices','手工净值','/prices/new','◇'),('analysis','投资分析',none,'↗'),
+    ('alerts','提醒中心','/alerts','○'),('imports','数据导入',none,'↓'),('settings','偏好设置',none,'⚙')
+  ] %}
+    {% if url and not demo %}<a class="nav-item {{ 'active' if section == key }}" href="{{ url }}" {% if section == key %}aria-current="page"{% endif %}><span aria-hidden="true">{{ icon }}</span>{{ label }}</a>
+    {% elif demo and key == 'dashboard' %}<a class="nav-item active" href="/preview" aria-current="page"><span>◈</span>资产总览</a>
+    {% else %}<span class="nav-item unavailable" aria-disabled="true"><span aria-hidden="true">{{ icon }}</span>{{ label }}<small>{{ '登录后' if url else '即将可用' }}</small></span>{% endif %}
+  {% endfor %}
+  </nav>
+  <div class="sidebar-note"><span>慢慢积累，认真生活。</span><p>把每一笔钱，放在心里有数的位置。</p><span class="local-dot"></span> 本地私人账本</div>
+  {% if not demo %}<form class="signout" method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><span>{{ user.username }}</span><button type="submit">退出登录 ↗</button></form>{% endif %}
+</aside>
+<main id="main" class="main">
+  {% if demo %}<div class="demo-banner" role="status">演示预览 · 空白账本界面，不读取真实财务数据。<a href="/login">登录自己的账本 ↗</a></div>{% endif %}
+  <header class="page-header"><div><p class="eyebrow">有数 / {% block eyebrow %}OVERVIEW{% endblock %}</p><h1>{% block heading %}看清当下，从容向前。{% endblock %}</h1><p class="subtitle">{% block subtitle %}先照顾好生活，再让积累发生。{% endblock %}</p></div><div class="date-stamp"><span class="local-dot"></span> 本地账本<time datetime="{{ vm.today }}">{{ vm.today.replace('-', ' / ') }}</time></div></header>
+  {% block content %}{% endblock %}
+  <footer>有数 · 每一份确定，都来自真实记录。<span>金额单位：人民币元 · Asia/Shanghai</span></footer>
+</main>
+<nav class="mobile-nav" aria-label="移动导航"><a href="{{ '/preview' if demo else '/' }}" {{ 'aria-current=page' if section == 'dashboard' }}>◈<span>总览</span></a>{% if not demo %}<a href="/transactions" {{ 'aria-current=page' if section == 'transactions' }}>⇄<span>流水</span></a><a href="/accounts" {{ 'aria-current=page' if section == 'accounts' }}>▦<span>账户</span></a><a href="/alerts" {{ 'aria-current=page' if section == 'alerts' }}>○<span>提醒</span></a>{% else %}<a href="/login">↗<span>登录</span></a>{% endif %}</nav>
+</body></html>
