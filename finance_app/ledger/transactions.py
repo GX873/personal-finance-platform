@@ -3,7 +3,7 @@
 import json
 from dataclasses import replace
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from typing import NamedTuple
 
 from sqlalchemy import select
@@ -132,11 +132,13 @@ def _replay(
                     raise ValueError(
                         "transaction would make historical position negative"
                     )
-                removed_cost = int(
-                    (Decimal(cost) * row.quantity / quantity).quantize(
-                        Decimal(1), rounding=ROUND_HALF_UP
-                    )
-                )
+                sold_numerator, sold_denominator = row.quantity.as_integer_ratio()
+                total_numerator, total_denominator = quantity.as_integer_ratio()
+                numerator = cost * sold_numerator * total_denominator
+                denominator = sold_denominator * total_numerator
+                # Exact positive rational HALF_UP avoids Decimal context rounding
+                # a large cost before the final cent is rounded.
+                removed_cost = (2 * numerator + denominator) // (2 * denominator)
                 quantity -= row.quantity
                 cost = cost - removed_cost if quantity else 0
                 cash += row.amount_cents - row.fee_cents
@@ -158,9 +160,7 @@ def account_cash_balance(session: Session, account_id: int) -> int:
     return _replay(session, account_id)[0]
 
 
-def calculate_position(
-    session: Session, account_id: int, asset_id: int
-) -> Position:
+def calculate_position(session: Session, account_id: int, asset_id: int) -> Position:
     return Position(*_replay(session, account_id)[1].get(asset_id, (Decimal(0), 0)))
 
 

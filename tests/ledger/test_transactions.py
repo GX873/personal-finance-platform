@@ -72,6 +72,40 @@ def test_cost_cash_sales_and_rebuild(session, funded):
     assert holding.valuation_cents is None
 
 
+def test_extreme_cost_partial_sale_rounds_without_intermediate_precision_loss(
+    session, funded
+):
+    cost = 9000049999999910000
+    post_transaction(
+        session,
+        PostTransaction("test", "large-funding", "TRANSFER_IN", funded[0], cost, NOW),
+    )
+    post_transaction(
+        session,
+        buy(
+            funded, amount_cents=cost, fee_cents=0, quantity=Decimal("999999.99999999")
+        ),
+    )
+    post_transaction(
+        session,
+        buy(
+            funded,
+            "partial",
+            kind="SELL",
+            amount_cents=1,
+            fee_cents=0,
+            quantity=Decimal("999999.99999998"),
+            occurred_at=NOW + timedelta(days=2),
+        ),
+    )
+    session.commit()
+    session.expire_all()
+    position = calculate_position(session, *funded)
+    assert position.quantity == Decimal("0.00000001")
+    assert position.cost_cents == 90001
+    assert rebuild_position(session, *funded).cost_cents == 90001
+
+
 def test_idempotency_conflict_and_rollback(session, funded):
     command = buy(funded)
     original = post_transaction(session, command)
