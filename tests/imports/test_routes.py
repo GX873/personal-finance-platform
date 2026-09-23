@@ -481,6 +481,44 @@ def test_expected_import_failures_are_safe_422_without_writes(
     assert db_session.scalar(select(ImportBatch)) is None
 
 
+@pytest.mark.parametrize(
+    "member_name", ["xl/workbook.xml", "xl/worksheets/sheet1.xml"]
+)
+def test_malformed_xlsx_xml_is_safe_422_without_disclosure(
+    client: TestClient, db_session, member_name: str
+) -> None:
+    from tests.imports.test_parser import replace_zip_member, workbook_bytes
+
+    login(client)
+    content = workbook_bytes(
+        ["基金代码", "基金名称", "份额", "持仓成本", "日期"],
+        ["000001", "示例基金", "1", "10.00", "2026-09-23"],
+    )
+    corrupted = replace_zip_member(content, member_name, b"<broken")
+    token = csrf(client, "/imports")
+    with TestClient(
+        client.app, follow_redirects=False, raise_server_exceptions=False
+    ) as error_client:
+        error_client.cookies.update(client.cookies)
+        response = error_client.post(
+            "/imports/preview",
+            data={"csrf_token": token},
+            files={
+                "file": ("positions.xlsx", corrupted, "application/octet-stream")
+            },
+        )
+
+    assert response.status_code == 422
+    assert "XLSX workbook could not be read" in response.text
+    assert "&lt;broken" not in response.text
+    assert member_name not in response.text
+    assert 'action="/imports/preview"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
+    db_session.expire_all()
+    assert db_session.scalar(select(Transaction)) is None
+    assert db_session.scalar(select(ImportBatch)) is None
+
+
 def test_preview_offloads_ocr_and_structured_parsing_from_event_loop(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -564,6 +602,32 @@ def test_confirm_validation_error_writes_nothing_and_is_editable(
     assert "保留名称" in response.text
     assert "1e2" in response.text
     assert "validation-errors" in response.text
+    db_session.expire_all()
+    assert db_session.scalar(select(Transaction)) is None
+    assert db_session.scalar(select(ImportBatch)) is None
+
+
+def test_confirm_giant_money_is_a_validation_error_without_writes(
+    client: TestClient, db_session
+) -> None:
+    login(client)
+    content = "基金代码,基金名称,份额,持仓成本,日期\n000001,示例基金,1,10.00,2026-09-23\n".encode()
+    digest = hashlib.sha256(content).hexdigest()
+    assert upload_csv(client, content).status_code == 200
+    account_id = db_session.scalar(select(Account.id))
+    giant = "9" * 5_000
+    data = confirmation_data(digest, account_id)
+    data["csrf_token"] = csrf(client, "/imports")
+    data["rows-0-cost"] = giant
+    with TestClient(
+        client.app, follow_redirects=False, raise_server_exceptions=False
+    ) as error_client:
+        error_client.cookies.update(client.cookies)
+        response = error_client.post("/imports/confirm", data=data)
+
+    assert response.status_code == 422
+    assert "成本金额超出可记录范围" in response.text
+    assert f'name="rows-0-cost" value="{giant}"' in response.text
     db_session.expire_all()
     assert db_session.scalar(select(Transaction)) is None
     assert db_session.scalar(select(ImportBatch)) is None

@@ -10,6 +10,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 from pathlib import Path
+from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook  # type: ignore[import-untyped]
@@ -42,7 +43,9 @@ _ALIASES = {
 _MONEY = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?")
 _QUANTITY = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?")
 _CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-_MAX_CENTS = 2**63 - 1
+MAX_CENTS = 2**63 - 1
+_MAX_CENTS_TEXT = str(MAX_CENTS)
+_MAX_QUANTITY_WHOLE = "1000000"
 
 
 class ImportFileError(ValueError):
@@ -100,11 +103,14 @@ def _money(value: str, label: str, errors: list[str]) -> int | None:
         errors.append(f"{label}必须是最多两位小数的非负金额")
         return None
     whole, dot, fraction = value.partition(".")
-    cents = int(whole) * 100 + int((fraction + "00")[:2] if dot else "00")
-    if cents > _MAX_CENTS:
+    cents_text = (whole + ((fraction + "00")[:2] if dot else "00")).lstrip("0")
+    cents_text = cents_text or "0"
+    if len(cents_text) > len(_MAX_CENTS_TEXT) or (
+        len(cents_text) == len(_MAX_CENTS_TEXT) and cents_text > _MAX_CENTS_TEXT
+    ):
         errors.append(f"{label}超出可记录范围")
         return None
-    return cents
+    return int(cents_text)
 
 
 def _quantity(value: str, errors: list[str]) -> Decimal | None:
@@ -113,13 +119,21 @@ def _quantity(value: str, errors: list[str]) -> Decimal | None:
     if _QUANTITY.fullmatch(value) is None:
         errors.append("份额必须是最多八位小数的非负数字")
         return None
+    whole, _, fraction = value.partition(".")
+    if (
+        len(whole) > len(_MAX_QUANTITY_WHOLE)
+        or (
+            len(whole) == len(_MAX_QUANTITY_WHOLE)
+            and whole > _MAX_QUANTITY_WHOLE
+        )
+        or (whole == _MAX_QUANTITY_WHOLE and any(digit != "0" for digit in fraction))
+    ):
+        errors.append("份额超出可记录范围")
+        return None
     try:
         parsed = Decimal(value)
     except InvalidOperation:
         errors.append("份额格式无效")
-        return None
-    if parsed > Decimal(1000000):
-        errors.append("份额超出可记录范围")
         return None
     return parsed
 
@@ -326,7 +340,14 @@ def _xlsx_rows(content: bytes) -> list[dict[str, object]]:
         return rows
     except ImportFileError:
         raise
-    except (BadZipFile, OSError, ValueError, KeyError, StopIteration) as exc:
+    except (
+        BadZipFile,
+        OSError,
+        ParseError,
+        ValueError,
+        KeyError,
+        StopIteration,
+    ) as exc:
         raise ImportFileError("XLSX workbook could not be read") from exc
     finally:
         if workbook is not None:

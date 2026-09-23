@@ -43,6 +43,17 @@ def zip_bytes(entries: list[tuple[str, bytes]]) -> bytes:
     return output.getvalue()
 
 
+def replace_zip_member(content: bytes, member_name: str, replacement: bytes) -> bytes:
+    output = BytesIO()
+    with ZipFile(BytesIO(content)) as source, ZipFile(
+        output, "w", ZIP_DEFLATED
+    ) as destination:
+        for entry in source.infolist():
+            payload = replacement if entry.filename == member_name else source.read(entry)
+            destination.writestr(entry, payload)
+    return output.getvalue()
+
+
 def test_xlsx_normalizes_chinese_columns_and_exact_money() -> None:
     content = workbook_bytes(
         ["基金代码", "基金名称", "份额", "持仓成本", "当前市值", "日期"],
@@ -96,6 +107,75 @@ def test_parser_reports_strict_numeric_validation_errors() -> None:
     assert any("成本" in error for error in row.errors)
 
 
+def test_giant_exact_numbers_become_row_validation_errors() -> None:
+    giant = "9" * 5_000
+    content = (
+        "基金代码,基金名称,份额,持仓成本,当前市值,可用现金,日期\n"
+        f"000001,示例,{giant},{giant},{giant},{giant},2026-09-23\n"
+    ).encode()
+
+    row = parse_portfolio_file(content, "positions.csv")[0]
+
+    assert row.quantity is None
+    assert row.cost_cents is None
+    assert row.market_value_cents is None
+    assert row.available_cash_cents is None
+    assert "份额超出可记录范围" in row.errors
+    assert "成本金额超出可记录范围" in row.errors
+    assert "当前市值超出可记录范围" in row.errors
+    assert "可用现金超出可记录范围" in row.errors
+
+
+def test_giant_quantity_is_rejected_before_decimal_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_decimal = parser.Decimal
+
+    def guarded_decimal(value):
+        assert len(str(value)) < 100, "giant value reached Decimal conversion"
+        return real_decimal(value)
+
+    monkeypatch.setattr(parser, "Decimal", guarded_decimal)
+
+    row = parser.normalize_row(
+        {
+            "asset_code": "000001",
+            "asset_name": "示例",
+            "quantity": "9" * 5_000,
+            "cost": "10.00",
+            "date": "2026-09-23",
+        }
+    )
+
+    assert row.quantity is None
+    assert "份额超出可记录范围" in row.errors
+
+
+def test_money_range_accepts_max_cents_and_rejects_one_cent_more() -> None:
+    maximum = parser.normalize_row(
+        {
+            "asset_code": "000001",
+            "asset_name": "示例",
+            "quantity": "1",
+            "cost": "92233720368547758.07",
+            "date": "2026-09-23",
+        }
+    )
+    over = parser.normalize_row(
+        {
+            "asset_code": "000001",
+            "asset_name": "示例",
+            "quantity": "1",
+            "cost": "92233720368547758.08",
+            "date": "2026-09-23",
+        }
+    )
+
+    assert maximum.cost_cents == 2**63 - 1
+    assert over.cost_cents is None
+    assert "成本金额超出可记录范围" in over.errors
+
+
 @pytest.mark.parametrize(
     ("content", "filename"),
     [
@@ -128,6 +208,37 @@ def test_unexpected_csv_failures_are_not_hidden(
 
     with pytest.raises(type(failure)):
         parse_portfolio_file(b"header\nvalue\n", "positions.csv")
+
+
+@pytest.mark.parametrize(
+    "member_name", ["xl/workbook.xml", "xl/worksheets/sheet1.xml"]
+)
+def test_malformed_xlsx_xml_is_a_safe_import_error(member_name: str) -> None:
+    content = workbook_bytes(
+        ["基金代码", "基金名称", "份额", "持仓成本", "日期"],
+        ["000001", "示例基金", "1", "10.00", "2026-09-23"],
+    )
+    corrupted = replace_zip_member(content, member_name, b"<broken")
+
+    with pytest.raises(ImportFileError, match="XLSX workbook could not be read"):
+        parse_portfolio_file(corrupted, "positions.xlsx")
+
+
+def test_unexpected_xlsx_memory_error_is_not_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = workbook_bytes(
+        ["基金代码", "基金名称", "份额", "持仓成本", "日期"],
+        ["000001", "示例基金", "1", "10.00", "2026-09-23"],
+    )
+    monkeypatch.setattr(
+        parser,
+        "load_workbook",
+        lambda *args, **kwargs: (_ for _ in ()).throw(MemoryError("oom")),
+    )
+
+    with pytest.raises(MemoryError, match="oom"):
+        parse_portfolio_file(content, "positions.xlsx")
 
 
 def csv_rows(count: int, *, extra_headers: list[str] | None = None) -> bytes:
