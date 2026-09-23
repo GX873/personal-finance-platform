@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from statistics import fmean
@@ -34,6 +35,13 @@ from finance_app.imports.parser import (
     PortfolioRow,
     normalize_row,
     parse_portfolio_file,
+)
+from finance_app.imports.preview_store import (
+    PreviewMetadata,
+    PreviewMetadataError,
+    delete_preview_metadata,
+    load_preview_metadata,
+    save_preview_metadata,
 )
 from finance_app.ledger.models import Account, Asset
 from finance_app.ledger.schemas import PostTransaction
@@ -163,8 +171,17 @@ async def preview_import(
                 "source_text": "\n".join(row.source_text for row in rows),
                 "requires_confirmation": False,
             }
-        (_private_dir() / f"{digest}{extension}").write_bytes(content)
-        request.session["import_preview"] = _session_preview(preview)
+        private_dir = _private_dir()
+        (private_dir / f"{digest}{extension}").write_bytes(content)
+        preview_id = save_preview_metadata(private_dir, _preview_metadata(preview))
+        previous_id = _session_preview_id(request)
+        try:
+            if previous_id is not None:
+                delete_preview_metadata(private_dir, previous_id)
+        except (OSError, PreviewMetadataError):
+            delete_preview_metadata(private_dir, preview_id)
+            raise
+        request.session["import_preview"] = {"id": preview_id}
         return _preview_context(request, user, preview)
     except HTTPException:
         raise
@@ -188,7 +205,7 @@ def _form_rows(form: Any) -> list[dict[str, str]]:
     return [rows[index] for index in sorted(rows)]
 
 
-def _session_preview(preview: dict[str, Any]) -> dict[str, Any]:
+def _preview_metadata(preview: dict[str, Any]) -> PreviewMetadata:
     return {
         "sha256": preview["sha256"],
         "filename": preview["filename"],
@@ -201,8 +218,26 @@ def _session_preview(preview: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _session_preview_id(request: Request) -> str | None:
+    preview_state = request.session.get("import_preview")
+    if not isinstance(preview_state, dict):
+        return None
+    preview_id = preview_state.get("id")
+    return preview_id if isinstance(preview_id, str) else None
+
+
+def _load_session_preview(request: Request) -> tuple[str, PreviewMetadata] | None:
+    preview_id = _session_preview_id(request)
+    if preview_id is None:
+        return None
+    try:
+        return preview_id, load_preview_metadata(_private_dir(), preview_id)
+    except (ImportFileError, OSError, PreviewMetadataError):
+        return None
+
+
 def _confirmed_rows(
-    submitted_rows: list[dict[str, str]], preview_state: dict[str, Any]
+    submitted_rows: list[dict[str, str]], preview_state: Mapping[str, object]
 ) -> list[PortfolioRow]:
     metadata = preview_state.get("rows")
     metadata_rows = metadata if isinstance(metadata, list) else []
@@ -228,7 +263,7 @@ def _confirmed_rows(
 
 
 def _confirmation_preview(
-    digest: str, rows: list[PortfolioRow], preview_state: dict[str, Any]
+    digest: str, rows: list[PortfolioRow], preview_state: Mapping[str, object]
 ) -> dict[str, Any]:
     filename = preview_state.get("filename")
     source_text = preview_state.get("source_text")
@@ -254,14 +289,15 @@ async def confirm_import(
         return _preview_context(
             request, user, {"rows": []}, error="invalid import hash"
         )
-    preview_state = request.session.get("import_preview")
-    if not isinstance(preview_state, dict) or preview_state.get("sha256") != digest:
+    loaded_preview = _load_session_preview(request)
+    if loaded_preview is None or loaded_preview[1]["sha256"] != digest:
         return _preview_context(
             request,
             user,
             {"rows": []},
             error="import confirmation does not match the latest preview",
         )
+    preview_id, preview_state = loaded_preview
     if db.scalar(select(ImportBatch).where(ImportBatch.sha256 == digest)) is not None:
         raise HTTPException(status_code=409, detail="file already imported")
     try:
@@ -338,6 +374,10 @@ async def confirm_import(
             )
         )
         db.commit()
+        try:
+            delete_preview_metadata(_private_dir(), preview_id)
+        except (ImportFileError, OSError, PreviewMetadataError):
+            pass
         request.session.pop("import_preview", None)
     except (ValueError, IntegrityError) as exc:
         db.rollback()

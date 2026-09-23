@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -131,6 +133,92 @@ def test_preview_hashes_and_stores_privately_without_writing_ledger(
     assert db_session.scalar(select(ImportBatch)) is None
 
 
+def test_multiline_preview_keeps_cookie_small_and_metadata_server_side(
+    client: TestClient, tmp_path: Path
+) -> None:
+    login(client)
+    content = (
+        "基金代码,基金名称,份额,持仓成本,日期\n"
+        + "".join(
+            f"{index:06d},第{index}只基金,1,10.00,2026-09-23\n"
+            for index in range(1, 101)
+        )
+    ).encode()
+
+    response = upload_csv(client, content)
+
+    assert response.status_code == 200
+    set_cookie = response.headers["set-cookie"]
+    encoded_session = client.cookies["session"].split(".", maxsplit=1)[0]
+    session_payload = json.loads(base64.b64decode(encoded_session))
+    preview_session = session_payload["import_preview"]
+    forbidden = {"source_text", "rows", "confidence"}
+    violations = {
+        "oversized": len(set_cookie.encode("latin-1")) > 4096,
+        "metadata_in_session": bool(forbidden & set(preview_session)),
+    }
+    assert not any(violations.values()), violations
+    assert set(preview_session) == {"id"}
+    metadata_files = list((tmp_path / "private-imports").glob("*.json"))
+    assert len(metadata_files) == 1
+    assert metadata_files[0].stem == preview_session["id"]
+    metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+    assert metadata["source_text"]
+    assert len(metadata["rows"]) == 100
+
+
+def test_new_preview_removes_previous_server_metadata(
+    client: TestClient, tmp_path: Path
+) -> None:
+    login(client)
+    first = "基金代码,基金名称,份额,持仓成本,日期\n000001,第一只,1,10.00,2026-09-23\n".encode()
+    second = "基金代码,基金名称,份额,持仓成本,日期\n000002,第二只,1,20.00,2026-09-23\n".encode()
+
+    assert upload_csv(client, first).status_code == 200
+    metadata_dir = tmp_path / "private-imports"
+    first_metadata_files = list(metadata_dir.glob("*.json"))
+    assert len(first_metadata_files) == 1
+    first_metadata = first_metadata_files[0]
+    assert upload_csv(client, second).status_code == 200
+
+    metadata_files = list(metadata_dir.glob("*.json"))
+    assert len(metadata_files) == 1
+    assert not first_metadata.exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "digest-mismatch"])
+def test_confirm_rejects_untrusted_server_metadata_without_writes(
+    client: TestClient, db_session, tmp_path: Path, failure: str
+) -> None:
+    login(client)
+    content = "基金代码,基金名称,份额,持仓成本,日期\n000001,示例基金,1,10.00,2026-09-23\n".encode()
+    digest = hashlib.sha256(content).hexdigest()
+    assert upload_csv(client, content).status_code == 200
+    metadata_files = list((tmp_path / "private-imports").glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata_file = metadata_files[0]
+    if failure == "missing":
+        metadata_file.unlink()
+    elif failure == "corrupt":
+        metadata_file.write_text("{not-json", encoding="utf-8")
+    else:
+        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+        metadata["sha256"] = "f" * 64
+        metadata_file.write_text(json.dumps(metadata), encoding="utf-8")
+    account_id = db_session.scalar(select(Account.id))
+    data = confirmation_data(digest, account_id)
+    data["csrf_token"] = csrf(client, "/imports")
+
+    response = client.post("/imports/confirm", data=data)
+
+    assert response.status_code == 422
+    assert str(metadata_file.parent) not in response.text
+    db_session.expire_all()
+    assert db_session.scalars(select(Transaction)).all() == []
+    assert db_session.scalars(select(ImportBatch)).all() == []
+    assert db_session.scalars(select(Asset)).all() == []
+
+
 def test_upload_storage_error_does_not_disclose_private_path(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -187,7 +275,7 @@ def test_confirm_without_a_preview_writes_nothing(
 
 
 def test_confirm_is_csrf_protected_uses_prg_audits_and_never_fabricates_price(
-    client: TestClient, db_session
+    client: TestClient, db_session, tmp_path: Path
 ) -> None:
     login(client)
     content = "基金代码,基金名称,份额,持仓成本,当前市值,日期\n000001,示例基金,2,20.00,25.00,2026-09-23\n".encode()
@@ -206,6 +294,9 @@ def test_confirm_is_csrf_protected_uses_prg_audits_and_never_fabricates_price(
         "rows-0-date": "2026-09-23",
     }
     assert preview.status_code == 200
+    metadata_files = list((tmp_path / "private-imports").glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata_file = metadata_files[0]
     assert client.post("/imports/confirm", data=data).status_code == 403
     data["csrf_token"] = csrf(client, "/imports")
 
@@ -227,6 +318,8 @@ def test_confirm_is_csrf_protected_uses_prg_audits_and_never_fabricates_price(
     events = list(db_session.scalars(select(AuditEvent)))
     assert "import.confirmed" in [event.event_type for event in events]
     assert all("positions.csv" not in event.details_json for event in events)
+    assert not metadata_file.exists()
+    assert (tmp_path / "private-imports" / f"{digest}.csv").read_bytes() == content
 
 
 def test_same_confirmed_file_is_not_imported_twice(
@@ -433,7 +526,7 @@ def test_ocr_preview_is_candidate_only(
 
 
 def test_ocr_validation_error_preserves_trusted_preview_metadata_and_edits(
-    client: TestClient, db_session, monkeypatch
+    client: TestClient, db_session, monkeypatch, tmp_path: Path
 ) -> None:
     login(client)
     source_text = "基金代码 000001\n基金名称 OCR基金\n份额 1"
@@ -458,6 +551,9 @@ def test_ocr_validation_error_preserves_trusted_preview_metadata_and_edits(
     content = b"fake-image"
     digest = hashlib.sha256(content).hexdigest()
     assert upload_csv(client, content, "screenshot.png").status_code == 200
+    metadata_files = list((tmp_path / "private-imports").glob("*.json"))
+    assert len(metadata_files) == 1
+    metadata_file = metadata_files[0]
     account_id = db_session.scalar(select(Account.id))
 
     response = client.post(
@@ -490,6 +586,7 @@ def test_ocr_validation_error_preserves_trusted_preview_metadata_and_edits(
     assert "requires confirmation" in response.text.lower()
     assert "forged overall source" not in response.text
     assert "forged row source" not in response.text
+    assert metadata_file.exists()
     db_session.expire_all()
     assert db_session.scalar(select(Transaction)) is None
     assert db_session.scalar(select(ImportBatch)) is None
