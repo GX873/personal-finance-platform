@@ -7,13 +7,14 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import Column, Integer, Table, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from alembic import command
 from finance_app.auth.models import User
 from finance_app.db import (
+    Base,
     create_db_engine,
     get_engine,
     get_session_factory,
@@ -24,12 +25,69 @@ from finance_app.ledger.models import (
     Account,
     Asset,
     Holding,
+    MonthlyBudget,
     PortfolioRole,
     RiskLevel,
     Transaction,
 )
 from finance_app.notifications.models import AppSetting, ImportBatch, JobRun
 from finance_app.portfolio.models import PriceSnapshot
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_initial_revision_is_independent_of_future_models(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, direction: str
+):
+    database_url = f"sqlite:///{tmp_path / 'frozen-migration.db'}"
+    monkeypatch.setenv("FINANCE_DATABASE_URL", database_url)
+    config = Config("alembic.ini")
+    engine = create_db_engine(database_url)
+    future_table = None
+    try:
+        if direction == "downgrade":
+            command.upgrade(config, "head")
+        future_table = Table(
+            "future_unrelated_table",
+            Base.metadata,
+            Column("id", Integer, primary_key=True),
+        )
+        if direction == "upgrade":
+            command.upgrade(config, "head")
+            assert future_table.name not in inspect(engine).get_table_names()
+        else:
+            future_table.create(engine)
+            with engine.begin() as connection:
+                connection.execute(future_table.insert().values(id=42))
+            command.downgrade(config, "base")
+            assert set(inspect(engine).get_table_names()) == {
+                "alembic_version",
+                future_table.name,
+            }
+            with engine.connect() as connection:
+                assert connection.execute(future_table.select()).scalar_one() == 42
+    finally:
+        if future_table is not None:
+            Base.metadata.remove(future_table)
+        engine.dispose()
+
+
+def test_initial_revision_matches_current_model_schema(db_session: Session):
+    command.check(Config("alembic.ini"))
+
+
+@pytest.mark.parametrize(
+    "month", ["2026-00", "2026-13", "2026-19", "2026-1", "202x-12"]
+)
+def test_monthly_budget_rejects_invalid_months(db_session: Session, month: str):
+    db_session.add(MonthlyBudget(month=month, bucket_kind="cash", amount_cents=100))
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+
+@pytest.mark.parametrize("month", ["2026-01", "2026-12"])
+def test_monthly_budget_accepts_month_boundaries(db_session: Session, month: str):
+    db_session.add(MonthlyBudget(month=month, bucket_kind="cash", amount_cents=100))
+    db_session.commit()
 
 
 @pytest.fixture

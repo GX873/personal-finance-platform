@@ -156,7 +156,8 @@ class MonthlyBudget(Base):
             "month", "bucket_kind", name="uq_monthly_budgets_month_bucket_kind"
         ),
         CheckConstraint(
-            "length(month) = 7 AND month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'",
+            "length(month) = 7 AND month GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]' "
+            "AND substr(month, 6, 2) BETWEEN '01' AND '12'",
             name="ck_monthly_budgets_month",
         ),
     )

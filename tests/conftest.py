@@ -8,10 +8,15 @@ from fastapi.testclient import TestClient
 @pytest.fixture(autouse=True)
 def clear_settings_cache():
     from finance_app.config import get_settings
+    from finance_app.db import reset_database_state
 
+    reset_database_state()
     get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        reset_database_state()
+        get_settings.cache_clear()
 
 
 @pytest.fixture
