@@ -4,6 +4,7 @@ import json
 import re
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from alembic.config import Config
@@ -271,6 +272,27 @@ def test_mobile_navigation_links_manual_price_entry(client):
     mobile_nav = page.text.split('class="mobile-nav"', 1)[1].split("</nav>", 1)[0]
     assert 'href="/prices/new"' in mobile_nav
     assert "净值" in mobile_nav
+
+
+def test_mobile_navigation_uses_five_shrinkable_equal_columns():
+    css = Path("finance_app/static/app.css").read_text(encoding="utf-8")
+    mobile_css = css.split("@media(max-width:760px)", 1)[1].split(
+        "@media(prefers-reduced-motion:reduce)", 1
+    )[0]
+    nav_rule = re.search(r"\.mobile-nav\{([^}]*)\}", mobile_css)
+    link_rule = re.search(r"\.mobile-nav a\{([^}]*)\}", mobile_css)
+
+    assert nav_rule is not None
+    assert link_rule is not None
+    nav_declarations = dict(
+        declaration.split(":", 1) for declaration in nav_rule.group(1).split(";")
+    )
+    link_declarations = dict(
+        declaration.split(":", 1) for declaration in link_rule.group(1).split(";")
+    )
+    assert nav_declarations["display"] == "flex"
+    assert link_declarations["flex"] == "1 1 0"
+    assert link_declarations["min-width"] == "0"
 
 
 def test_transaction_failure_rolls_back_service_and_web_audit(client, db_session):
