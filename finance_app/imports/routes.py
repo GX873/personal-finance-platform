@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from finance_app.auth.models import User
 from finance_app.auth.routes import templates
@@ -142,7 +143,7 @@ async def preview_import(
             raise HTTPException(status_code=409, detail="file already imported")
         extension = Path(filename).suffix.lower()
         if extension in _IMAGE_EXTENSIONS:
-            ocr = extract_candidates(content)
+            ocr = await run_in_threadpool(extract_candidates, content)
             confidence = (
                 fmean(candidate.confidence for candidate in ocr.candidates)
                 if ocr.candidates
@@ -163,7 +164,7 @@ async def preview_import(
                 "requires_confirmation": True,
             }
         else:
-            rows = parse_portfolio_file(content, filename)
+            rows = await run_in_threadpool(parse_portfolio_file, content, filename)
             preview = {
                 "sha256": digest,
                 "filename": filename,
@@ -187,7 +188,7 @@ async def preview_import(
         raise
     except ImportFileError as exc:
         return _preview_context(request, user, None, error=str(exc))
-    except (OSError, ValueError):
+    except (OSError, PreviewMetadataError):
         return _preview_context(
             request,
             user,

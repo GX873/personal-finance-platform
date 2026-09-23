@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import csv
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 from pathlib import Path
+from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook  # type: ignore[import-untyped]
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_IMPORT_ROWS = 2_000
+MAX_IMPORT_COLUMNS = 64
+MAX_IMPORT_CELLS = 50_000
+MAX_IMPORT_FIELD_CHARACTERS = 10_000
+MAX_PREVIEW_CHARACTERS = 2 * 1024 * 1024
+MAX_XLSX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+MAX_XLSX_ENTRY_BYTES = 25 * 1024 * 1024
+MAX_XLSX_COMPRESSION_RATIO = 200
+_MIN_RATIO_CHECK_BYTES = 1_024
 ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".png", ".jpg", ".jpeg"}
 
 _ALIASES = {
@@ -189,34 +199,138 @@ def _row(raw: dict[str, object]) -> PortfolioRow:
     return normalize_row(_normalized_values(raw), source_text=source_text)
 
 
+def _bounded_texts(values: Sequence[object]) -> list[str]:
+    texts = [_cell_text(value) for value in values]
+    if any(len(text) > MAX_IMPORT_FIELD_CHARACTERS for text in texts):
+        raise ImportFileError("import field limit exceeded")
+    return texts
+
+
+def _check_columns(count: int) -> None:
+    if count > MAX_IMPORT_COLUMNS:
+        raise ImportFileError("import column limit exceeded")
+
+
+def _check_cells(count: int) -> None:
+    if count > MAX_IMPORT_CELLS:
+        raise ImportFileError("import cell limit exceeded")
+
+
+def _row_preview_characters(headers: list[str], values: list[str]) -> int:
+    pair_count = min(len(headers), len(values))
+    if pair_count == 0:
+        return 0
+    return sum(
+        len(headers[index]) + 2 + len(values[index]) for index in range(pair_count)
+    ) + 3 * (pair_count - 1)
+
+
+def _check_preview_characters(count: int) -> None:
+    if count > MAX_PREVIEW_CHARACTERS:
+        raise ImportFileError("import preview size limit exceeded")
+
+
 def _csv_rows(content: bytes) -> list[dict[str, object]]:
     try:
         decoded = content.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ImportFileError("CSV must be UTF-8 encoded") from exc
-    reader = csv.DictReader(StringIO(decoded))
-    if reader.fieldnames is None:
-        raise ImportFileError("CSV is missing a header row")
-    return [
-        dict(row) for row in reader if any(_cell_text(value) for value in row.values())
-    ]
+    try:
+        reader = csv.reader(StringIO(decoded), strict=True)
+        try:
+            raw_headers = next(reader)
+        except StopIteration as exc:
+            raise ImportFileError("CSV is missing a header row") from exc
+        headers = _bounded_texts(raw_headers)
+        if not headers:
+            raise ImportFileError("CSV is missing a header row")
+        _check_columns(len(headers))
+        cells = len(headers)
+        _check_cells(cells)
+        preview_characters = 0
+        rows: list[dict[str, object]] = []
+        for row_number, raw_values in enumerate(reader, start=1):
+            if row_number > MAX_IMPORT_ROWS:
+                raise ImportFileError("import row limit exceeded")
+            if len(raw_values) > len(headers):
+                raise ImportFileError("import column limit exceeded")
+            _check_columns(len(raw_values))
+            cells += len(raw_values)
+            _check_cells(cells)
+            values = _bounded_texts(raw_values)
+            preview_characters += _row_preview_characters(headers, values)
+            _check_preview_characters(preview_characters)
+            if any(values):
+                rows.append(dict(zip(headers, raw_values, strict=False)))
+        return rows
+    except csv.Error as exc:
+        raise ImportFileError("CSV could not be read") from exc
+
+
+def _validate_xlsx_archive(content: bytes) -> None:
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            entries = archive.infolist()
+    except (BadZipFile, OSError) as exc:
+        raise ImportFileError("XLSX workbook could not be read") from exc
+
+    if sum(entry.file_size for entry in entries) > MAX_XLSX_UNCOMPRESSED_BYTES:
+        raise ImportFileError("XLSX expanded size limit exceeded")
+    for entry in entries:
+        if entry.file_size > MAX_XLSX_ENTRY_BYTES:
+            raise ImportFileError("XLSX entry size limit exceeded")
+        if (
+            entry.file_size >= _MIN_RATIO_CHECK_BYTES
+            and entry.file_size / max(entry.compress_size, 1)
+            > MAX_XLSX_COMPRESSION_RATIO
+        ):
+            raise ImportFileError("XLSX compression ratio limit exceeded")
 
 
 def _xlsx_rows(content: bytes) -> list[dict[str, object]]:
+    _validate_xlsx_archive(content)
+    workbook = None
     try:
         workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
         sheet = workbook.active
+        declared_rows = sheet.max_row or 0
+        declared_columns = sheet.max_column or 0
+        if declared_rows > MAX_IMPORT_ROWS + 1:
+            raise ImportFileError("import row limit exceeded")
+        _check_columns(declared_columns)
+        _check_cells(declared_rows * declared_columns)
         iterator = sheet.iter_rows(values_only=True)
-        headers = [_cell_text(value) for value in next(iterator)]
-        rows = [
-            dict(zip(headers, values, strict=False))
-            for values in iterator
-            if any(_cell_text(value) for value in values)
-        ]
-        workbook.close()
+        try:
+            raw_headers = next(iterator)
+        except StopIteration as exc:
+            raise ImportFileError("XLSX workbook could not be read") from exc
+        headers = _bounded_texts(raw_headers)
+        _check_columns(len(headers))
+        cells = len(headers)
+        _check_cells(cells)
+        preview_characters = 0
+        rows: list[dict[str, object]] = []
+        for row_number, raw_values in enumerate(iterator, start=1):
+            if row_number > MAX_IMPORT_ROWS:
+                raise ImportFileError("import row limit exceeded")
+            if len(raw_values) > len(headers):
+                raise ImportFileError("import column limit exceeded")
+            _check_columns(len(raw_values))
+            cells += len(raw_values)
+            _check_cells(cells)
+            values = _bounded_texts(raw_values)
+            preview_characters += _row_preview_characters(headers, values)
+            _check_preview_characters(preview_characters)
+            if any(values):
+                rows.append(dict(zip(headers, raw_values, strict=False)))
         return rows
-    except (OSError, ValueError, KeyError, StopIteration) as exc:
+    except ImportFileError:
+        raise
+    except (BadZipFile, OSError, ValueError, KeyError, StopIteration) as exc:
         raise ImportFileError("XLSX workbook could not be read") from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
 
 
 def parse_portfolio_file(content: bytes, filename: str) -> list[PortfolioRow]:

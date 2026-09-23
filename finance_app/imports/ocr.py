@@ -11,7 +11,14 @@ from statistics import fmean
 import pytesseract  # type: ignore[import-untyped]
 from PIL import Image
 from pytesseract import Output
+from pytesseract.pytesseract import (  # type: ignore[import-untyped]
+    TesseractError,
+    TesseractNotFoundError,
+)
 
+from finance_app.imports.parser import ImportFileError
+
+OCR_TIMEOUT_SECONDS = 30
 _PLAIN_NUMBER = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?")
 _MONEY = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -155,7 +162,19 @@ def extract_candidates(
 ) -> OcrPreview:
     """Extract bounded label/value candidates without writing financial data."""
     image = image_loader(content)
-    data = pytesseract.image_to_data(image, lang="chi_sim+eng", output_type=Output.DICT)
+    try:
+        data = pytesseract.image_to_data(
+            image,
+            lang="chi_sim+eng",
+            output_type=Output.DICT,
+            timeout=OCR_TIMEOUT_SECONDS,
+        )
+    except (TesseractError, TesseractNotFoundError) as exc:
+        raise ImportFileError("OCR could not be completed") from exc
+    except RuntimeError as exc:
+        if str(exc) != "Tesseract process timeout":
+            raise
+        raise ImportFileError("OCR timed out") from exc
     lines = _lines(data)
     candidates = [
         candidate

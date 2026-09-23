@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
+from pytesseract.pytesseract import TesseractError
 from sqlalchemy import select
 
 from finance_app.app import create_app
@@ -422,6 +424,117 @@ def test_parse_error_redisplays_the_upload_form(client: TestClient) -> None:
     assert 'action="/imports/preview"' in response.text
     assert 'type="file"' in response.text
     assert 'action="/imports/confirm"' not in response.text
+
+
+@pytest.mark.parametrize(
+    "failure", ["bad-xlsx", "long-csv", "ocr-error", "ocr-timeout"]
+)
+def test_expected_import_failures_are_safe_422_without_writes(
+    client: TestClient,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    login(client)
+    private_detail = r"C:\private\tesseract command failed"
+    if failure == "bad-xlsx":
+        content, filename = b"not-a-zip-file", "positions.xlsx"
+    elif failure == "long-csv":
+        content, filename = b"name\n" + b"x" * 200_000 + b"\n", "positions.csv"
+    else:
+        content, filename = b"image", "positions.png"
+
+        from finance_app.imports.ocr import extract_candidates
+
+        ocr_failure: Exception = (
+            TesseractError(1, private_detail)
+            if failure == "ocr-error"
+            else RuntimeError("Tesseract process timeout")
+        )
+        monkeypatch.setattr(
+            "finance_app.imports.ocr.pytesseract.image_to_data",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ocr_failure),
+        )
+        monkeypatch.setattr(
+            "finance_app.imports.routes.extract_candidates",
+            lambda payload: extract_candidates(
+                payload, image_loader=lambda _: object()
+            ),
+        )
+    token = csrf(client, "/imports")
+    with TestClient(
+        client.app, follow_redirects=False, raise_server_exceptions=False
+    ) as error_client:
+        error_client.cookies.update(client.cookies)
+        response = error_client.post(
+            "/imports/preview",
+            data={"csrf_token": token},
+            files={"file": (filename, content, "application/octet-stream")},
+        )
+
+    assert response.status_code == 422
+    assert 'action="/imports/preview"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
+    assert private_detail not in response.text
+    db_session.expire_all()
+    assert db_session.scalar(select(Transaction)) is None
+    assert db_session.scalar(select(ImportBatch)) is None
+
+
+def test_preview_offloads_ocr_and_structured_parsing_from_event_loop(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    login(client)
+    ran_in_worker: dict[str, bool] = {}
+
+    def record_worker(label: str) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            ran_in_worker[label] = True
+        else:
+            ran_in_worker[label] = False
+
+    def fake_parse(content: bytes, filename: str):
+        from finance_app.imports.parser import normalize_row
+
+        record_worker("parser")
+        return [
+            normalize_row(
+                {
+                    "asset_code": "000001",
+                    "asset_name": "示例基金",
+                    "quantity": "1",
+                    "cost": "10.00",
+                    "date": "2026-09-23",
+                },
+                source_text="structured source",
+            )
+        ]
+
+    def fake_ocr(content: bytes):
+        record_worker("ocr")
+        return SimpleNamespace(
+            values={
+                "asset_code": "000002",
+                "asset_name": "OCR基金",
+                "quantity": "1",
+                "cost": "20.00",
+                "date": "2026-09-23",
+            },
+            candidates=[],
+            source_text="ocr source",
+        )
+
+    monkeypatch.setattr("finance_app.imports.routes.parse_portfolio_file", fake_parse)
+    monkeypatch.setattr("finance_app.imports.routes.extract_candidates", fake_ocr)
+
+    csv_response = upload_csv(client, b"csv", "positions.csv")
+    image_response = upload_csv(client, b"image", "positions.png")
+
+    assert csv_response.status_code == 200
+    assert image_response.status_code == 200
+    assert ran_in_worker == {"parser": True, "ocr": True}
 
 
 def test_confirm_validation_error_writes_nothing_and_is_editable(
