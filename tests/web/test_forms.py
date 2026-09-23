@@ -72,6 +72,16 @@ def csrf(client, path: str) -> str:
     return match[1]
 
 
+def form_markup(html: str, action: str) -> str:
+    match = re.search(
+        rf'<form\b[^>]*action="{re.escape(action)}"[^>]*>.*?</form>',
+        html,
+        re.DOTALL,
+    )
+    assert match is not None
+    return match.group(0)
+
+
 def add_account(db_session, *, opening_balance_cents: int = 100_000) -> Account:
     account = Account(
         name="工资卡",
@@ -89,6 +99,32 @@ def add_asset(db_session) -> Asset:
     db_session.add(asset)
     db_session.commit()
     return asset
+
+
+def post_transfer_in(client, db_session, account: Account) -> Transaction:
+    assert login(client).status_code == 303
+    response = client.post(
+        "/transactions",
+        data={
+            "csrf_token": csrf(client, "/transactions/new"),
+            "kind": "TRANSFER_IN",
+            "account_id": str(account.id),
+            "asset_id": "",
+            "amount": "10",
+            "quantity": "",
+            "price": "",
+            "fee": "0",
+            "occurred_at": "2026-09-23T15:30",
+            "note": "",
+        },
+    )
+    assert response.status_code == 303
+    db_session.expire_all()
+    original = db_session.scalar(
+        select(Transaction).where(Transaction.reverses_transaction_id.is_(None))
+    )
+    assert original is not None
+    return original
 
 
 @pytest.mark.parametrize(
@@ -176,6 +212,44 @@ def test_account_errors_are_422_retain_input_and_write_nothing(
     db_session.expire_all()
     assert db_session.scalar(select(Account).where(Account.name == "保留这个名称")) is None
     assert db_session.scalar(select(AuditEvent)) is None
+
+
+def test_account_error_values_do_not_fill_asset_form(client):
+    assert login(client).status_code == 303
+    response = client.post(
+        "/accounts",
+        data={
+            "csrf_token": csrf(client, "/accounts"),
+            "name": "account-only-name",
+            "kind": "cash",
+            "currency": "CNY",
+            "opening_balance": "invalid",
+        },
+    )
+
+    assert response.status_code == 422
+    assert 'value="account-only-name"' in form_markup(response.text, "/accounts")
+    assert "account-only-name" not in form_markup(response.text, "/assets")
+
+
+def test_asset_error_values_do_not_fill_account_form(client):
+    assert login(client).status_code == 303
+    response = client.post(
+        "/assets",
+        data={
+            "csrf_token": csrf(client, "/accounts"),
+            "code": "asset-only-code",
+            "name": "asset-only-name",
+            "risk_level": "invalid",
+            "portfolio_role": "core",
+        },
+    )
+
+    assert response.status_code == 422
+    asset_form = form_markup(response.text, "/assets")
+    assert 'value="asset-only-code"' in asset_form
+    assert 'value="asset-only-name"' in asset_form
+    assert "asset-only-name" not in form_markup(response.text, "/accounts")
 
 
 def test_mutating_forms_require_csrf(client):
@@ -370,10 +444,13 @@ def test_reversal_requires_reason_and_appends_two_audit_meanings(client, db_sess
     original = db_session.scalar(select(Transaction))
     assert original is not None
     token = csrf(client, "/transactions")
-    assert client.post(
+    invalid_response = client.post(
         f"/transactions/{original.id}/reversal",
         data={"csrf_token": token, "reason": "   "},
-    ).status_code == 422
+    )
+    assert invalid_response.status_code == 422
+    assert 'role="alert"' in invalid_response.text
+    assert "冲正原因不能为空，且首尾不能有空格。" in invalid_response.text
     response = client.post(
         f"/transactions/{original.id}/reversal",
         data={"csrf_token": token, "reason": "重复录入"},
@@ -387,6 +464,71 @@ def test_reversal_requires_reason_and_appends_two_audit_meanings(client, db_sess
     event_types = list(db_session.scalars(select(AuditEvent.event_type)))
     assert "transaction.reversed" in event_types
     assert "transaction.reversal_requested" in event_types
+
+
+def test_duplicate_reversal_error_is_visible_and_rolls_back(client, db_session):
+    account = add_account(db_session)
+    original = post_transfer_in(client, db_session, account)
+    token = csrf(client, "/transactions")
+    assert client.post(
+        f"/transactions/{original.id}/reversal",
+        data={"csrf_token": token, "reason": "首次冲正"},
+    ).status_code == 303
+    db_session.expire_all()
+    transaction_count = len(db_session.scalars(select(Transaction)).all())
+    audit_count = len(db_session.scalars(select(AuditEvent)).all())
+
+    response = client.post(
+        f"/transactions/{original.id}/reversal",
+        data={"csrf_token": token, "reason": "再次冲正"},
+    )
+
+    assert response.status_code == 422
+    assert 'role="alert"' in response.text
+    assert "transaction is already reversed" in response.text
+    db_session.expire_all()
+    assert len(db_session.scalars(select(Transaction)).all()) == transaction_count
+    assert len(db_session.scalars(select(AuditEvent)).all()) == audit_count
+
+
+def test_reversing_a_reversal_error_is_visible_and_rolls_back(client, db_session):
+    account = add_account(db_session)
+    original = post_transfer_in(client, db_session, account)
+    token = csrf(client, "/transactions")
+    assert client.post(
+        f"/transactions/{original.id}/reversal",
+        data={"csrf_token": token, "reason": "首次冲正"},
+    ).status_code == 303
+    db_session.expire_all()
+    reversal = db_session.scalar(
+        select(Transaction).where(Transaction.reverses_transaction_id == original.id)
+    )
+    assert reversal is not None
+    transaction_count = len(db_session.scalars(select(Transaction)).all())
+    audit_count = len(db_session.scalars(select(AuditEvent)).all())
+
+    response = client.post(
+        f"/transactions/{reversal.id}/reversal",
+        data={"csrf_token": token, "reason": "非法冲正"},
+    )
+
+    assert response.status_code == 422
+    assert 'role="alert"' in response.text
+    assert "original transaction does not exist or is a reversal" in response.text
+    db_session.expire_all()
+    assert len(db_session.scalars(select(Transaction)).all()) == transaction_count
+    assert len(db_session.scalars(select(AuditEvent)).all()) == audit_count
+
+
+def test_reversal_of_missing_transaction_remains_404(client):
+    assert login(client).status_code == 303
+
+    response = client.post(
+        "/transactions/999999/reversal",
+        data={"csrf_token": csrf(client, "/transactions"), "reason": "找不到原交易"},
+    )
+
+    assert response.status_code == 404
 
 
 def test_manual_price_is_audited_idempotent_and_conflicts_on_change(client, db_session):

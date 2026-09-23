@@ -78,6 +78,8 @@ def _manual_page(
     status_code: int = 200,
     error: str | None = None,
     values: dict[str, str] | None = None,
+    account_values: dict[str, str] | None = None,
+    asset_values: dict[str, str] | None = None,
 ):
     context = _base_context(request, user, section)
     context.update(
@@ -86,6 +88,8 @@ def _manual_page(
             "assets": list(db.scalars(select(Asset).order_by(Asset.code))),
             "error": error,
             "values": values or {},
+            "account_values": account_values or {},
+            "asset_values": asset_values or {},
             "local_now": datetime.now(SHANGHAI).strftime("%Y-%m-%dT%H:%M"),
         }
     )
@@ -117,11 +121,14 @@ def page(request: Request, db: Annotated[Session, Depends(get_db)]):
     )
 
 
-@router.get("/transactions", response_class=HTMLResponse)
-def transactions_page(request: Request, db: Annotated[Session, Depends(get_db)]):
-    user = current_user(request, db)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
+def _transactions_page(
+    request: Request,
+    db: Session,
+    user: User,
+    *,
+    status_code: int = 200,
+    error: str | None = None,
+):
     context = _base_context(request, user, "transactions")
     rows = list(
         db.scalars(
@@ -142,11 +149,23 @@ def transactions_page(request: Request, db: Annotated[Session, Depends(get_db)])
                 for row in rows
                 if row.reverses_transaction_id is not None
             },
+            "error": error,
         }
     )
     return templates.TemplateResponse(
-        request=request, name="transactions.html", context=context
+        request=request,
+        name="transactions.html",
+        context=context,
+        status_code=status_code,
     )
+
+
+@router.get("/transactions", response_class=HTMLResponse)
+def transactions_page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return _transactions_page(request, db, user)
 
 
 @router.get("/transactions/new", response_class=HTMLResponse)
@@ -221,7 +240,7 @@ async def create_account(
             section="accounts",
             status_code=422,
             error=str(exc),
-            values=values,
+            account_values=values,
         )
     return RedirectResponse("/accounts", status_code=303)
 
@@ -283,7 +302,7 @@ async def create_asset(
             section="accounts",
             status_code=422,
             error=message,
-            values=values,
+            asset_values=values,
         )
     return RedirectResponse("/accounts", status_code=303)
 
@@ -398,9 +417,9 @@ async def reverse_manual_transaction(
         db.rollback()
         if db.get(Transaction, transaction_id) is None:
             raise HTTPException(status_code=404, detail="Transaction not found") from exc
-        response = transactions_page(request, db)
-        response.status_code = 422
-        return response
+        return _transactions_page(
+            request, db, user, status_code=422, error=str(exc)
+        )
     return RedirectResponse("/transactions", status_code=303)
 
 
