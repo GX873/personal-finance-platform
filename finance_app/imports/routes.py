@@ -101,7 +101,7 @@ async def _read_upload(upload: UploadFile) -> tuple[str, bytes]:
 
 
 def _preview_context(
-    request: Request, user: User, preview: dict[str, Any], *, error=None
+    request: Request, user: User, preview: dict[str, Any] | None, *, error=None
 ):
     from finance_app.db import get_session_factory
 
@@ -164,19 +164,17 @@ async def preview_import(
                 "requires_confirmation": False,
             }
         (_private_dir() / f"{digest}{extension}").write_bytes(content)
-        request.session["import_preview"] = {"sha256": digest}
+        request.session["import_preview"] = _session_preview(preview)
         return _preview_context(request, user, preview)
     except HTTPException:
         raise
     except ImportFileError as exc:
-        return _preview_context(
-            request, user, {"rows": [], "filename": ""}, error=str(exc)
-        )
+        return _preview_context(request, user, None, error=str(exc))
     except (OSError, ValueError):
         return _preview_context(
             request,
             user,
-            {"rows": [], "filename": ""},
+            None,
             error="upload could not be processed",
         )
 
@@ -188,6 +186,59 @@ def _form_rows(form: Any) -> list[dict[str, str]]:
         if match and isinstance(value, str):
             rows.setdefault(int(match.group(1)), {})[match.group(2)] = value
     return [rows[index] for index in sorted(rows)]
+
+
+def _session_preview(preview: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sha256": preview["sha256"],
+        "filename": preview["filename"],
+        "source_text": preview["source_text"],
+        "requires_confirmation": preview["requires_confirmation"],
+        "rows": [
+            {"source_text": row.source_text, "confidence": row.confidence}
+            for row in preview["rows"]
+        ],
+    }
+
+
+def _confirmed_rows(
+    submitted_rows: list[dict[str, str]], preview_state: dict[str, Any]
+) -> list[PortfolioRow]:
+    metadata = preview_state.get("rows")
+    metadata_rows = metadata if isinstance(metadata, list) else []
+    rows = []
+    for index, values in enumerate(submitted_rows):
+        item = metadata_rows[index] if index < len(metadata_rows) else {}
+        item = item if isinstance(item, dict) else {}
+        source_text = item.get("source_text")
+        confidence = item.get("confidence")
+        rows.append(
+            normalize_row(
+                values,
+                source_text=source_text if isinstance(source_text, str) else "",
+                confidence=(
+                    float(confidence)
+                    if isinstance(confidence, (int, float))
+                    and not isinstance(confidence, bool)
+                    else None
+                ),
+            )
+        )
+    return rows
+
+
+def _confirmation_preview(
+    digest: str, rows: list[PortfolioRow], preview_state: dict[str, Any]
+) -> dict[str, Any]:
+    filename = preview_state.get("filename")
+    source_text = preview_state.get("source_text")
+    return {
+        "sha256": digest,
+        "filename": filename if isinstance(filename, str) else "",
+        "rows": rows,
+        "source_text": source_text if isinstance(source_text, str) else "",
+        "requires_confirmation": preview_state.get("requires_confirmation") is True,
+    }
 
 
 @router.post("/imports/confirm", dependencies=[Depends(require_csrf)])
@@ -214,15 +265,26 @@ async def confirm_import(
     if db.scalar(select(ImportBatch).where(ImportBatch.sha256 == digest)) is not None:
         raise HTTPException(status_code=409, detail="file already imported")
     try:
-        rows = [normalize_row(values) for values in _form_rows(form)]
+        submitted_rows = _form_rows(form)
+        rows = _confirmed_rows(submitted_rows, preview_state)
         if not rows:
             raise ValueError("at least one row is required")
+        if any(values.get("available_cash", "").strip() for values in submitted_rows):
+            return _preview_context(
+                request,
+                user,
+                _confirmation_preview(digest, rows, preview_state),
+                error=(
+                    "当前不能从持仓快照自动写入现金；请清空“可用现金”字段后重试，"
+                    "并另行手工记录现金流水。"
+                ),
+            )
         errors = [error for row in rows for error in row.errors]
         if errors:
             return _preview_context(
                 request,
                 user,
-                {"sha256": digest, "rows": rows, "source_text": ""},
+                _confirmation_preview(digest, rows, preview_state),
                 error="; ".join(errors),
             )
         account_id = int(str(account_value))
@@ -279,11 +341,11 @@ async def confirm_import(
         request.session.pop("import_preview", None)
     except (ValueError, IntegrityError) as exc:
         db.rollback()
-        rows = [normalize_row(values) for values in _form_rows(form)]
+        rows = _confirmed_rows(_form_rows(form), preview_state)
         return _preview_context(
             request,
             user,
-            {"sha256": digest, "rows": rows, "source_text": ""},
+            _confirmation_preview(digest, rows, preview_state),
             error=str(exc),
         )
     return RedirectResponse("/transactions", status_code=303)

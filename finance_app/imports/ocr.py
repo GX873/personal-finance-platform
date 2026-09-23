@@ -52,6 +52,13 @@ class _Token:
     confidence: float
 
 
+@dataclass(frozen=True)
+class _Line:
+    block: object
+    paragraph: object
+    tokens: list[_Token]
+
+
 def _default_image_loader(content: bytes):
     image = Image.open(BytesIO(content))
     image.load()
@@ -65,7 +72,7 @@ def _confidence(raw: object) -> float:
         return 0.0
 
 
-def _lines(data: dict[str, list[object]]) -> list[list[_Token]]:
+def _lines(data: dict[str, list[object]]) -> list[_Line]:
     grouped: dict[tuple[object, object, object], list[_Token]] = {}
     count = len(data.get("text", []))
     for index in range(count):
@@ -82,7 +89,10 @@ def _lines(data: dict[str, list[object]]) -> list[list[_Token]]:
                 text=text, confidence=_confidence(data.get("conf", [0] * count)[index])
             )
         )
-    return list(grouped.values())
+    return [
+        _Line(block=key[0], paragraph=key[1], tokens=tokens)
+        for key, tokens in grouped.items()
+    ]
 
 
 def _label_index(tokens: list[_Token], aliases: tuple[str, ...]) -> int | None:
@@ -107,14 +117,21 @@ def _matches(field: str, value: str) -> bool:
 def _candidate(
     field: str,
     aliases: tuple[str, ...],
-    lines: list[list[_Token]],
+    lines: list[_Line],
 ) -> OcrCandidate | None:
-    for line_number, tokens in enumerate(lines):
+    for line_number, line in enumerate(lines):
+        tokens = line.tokens
         label_at = _label_index(tokens, aliases)
         if label_at is None:
             continue
         for candidate_line in range(line_number, min(line_number + 2, len(lines))):
-            possible = lines[candidate_line]
+            possible_line = lines[candidate_line]
+            if (
+                possible_line.block != line.block
+                or possible_line.paragraph != line.paragraph
+            ):
+                continue
+            possible = possible_line.tokens
             start = label_at + 1 if candidate_line == line_number else 0
             for token in possible[start:]:
                 value = token.text.strip(":：,，")
@@ -148,5 +165,7 @@ def extract_candidates(
     return OcrPreview(
         values={candidate.field: candidate.value for candidate in candidates},
         candidates=candidates,
-        source_text="\n".join(" ".join(token.text for token in line) for line in lines),
+        source_text="\n".join(
+            " ".join(token.text for token in line.tokens) for line in lines
+        ),
     )

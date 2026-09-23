@@ -82,3 +82,41 @@ def test_ocr_associates_a_label_with_the_adjacent_line_only(monkeypatch) -> None
     preview = extract_candidates(b"image", image_loader=lambda _: object())
 
     assert preview.values["available_cash"] == "12.34"
+
+
+def test_ocr_does_not_associate_adjacent_lines_across_blocks(monkeypatch) -> None:
+    def fake_image_to_data(image, *, lang, output_type):
+        return {
+            "text": ["可用现金", "12.34"],
+            "conf": ["90", "95"],
+            "block_num": [1, 2],
+            "par_num": [1, 1],
+            "line_num": [1, 1],
+        }
+
+    monkeypatch.setattr(
+        "finance_app.imports.ocr.pytesseract.image_to_data", fake_image_to_data
+    )
+
+    preview = extract_candidates(b"image", image_loader=lambda _: object())
+
+    assert "available_cash" not in preview.values
+
+
+def test_ocr_does_not_associate_adjacent_lines_across_paragraphs(monkeypatch) -> None:
+    def fake_image_to_data(image, *, lang, output_type):
+        return {
+            "text": ["可用现金", "12.34"],
+            "conf": ["90", "95"],
+            "block_num": [1, 1],
+            "par_num": [1, 2],
+            "line_num": [1, 1],
+        }
+
+    monkeypatch.setattr(
+        "finance_app.imports.ocr.pytesseract.image_to_data", fake_image_to_data
+    )
+
+    preview = extract_candidates(b"image", image_loader=lambda _: object())
+
+    assert "available_cash" not in preview.values

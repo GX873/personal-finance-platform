@@ -147,6 +147,9 @@ def test_upload_storage_error_does_not_disclose_private_path(
 
     assert response.status_code == 422
     assert private_path not in response.text
+    assert 'action="/imports/preview"' in response.text
+    assert 'type="file"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
 
 
 def test_confirm_requires_the_hash_from_the_latest_preview(
@@ -262,7 +265,23 @@ def test_upload_rejects_disallowed_extensions(
     client: TestClient, filename: str
 ) -> None:
     login(client)
-    assert upload_csv(client, b"x", filename).status_code == 422
+    response = upload_csv(client, b"x", filename)
+
+    assert response.status_code == 422
+    assert 'action="/imports/preview"' in response.text
+    assert 'type="file"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
+
+
+def test_parse_error_redisplays_the_upload_form(client: TestClient) -> None:
+    login(client)
+
+    response = upload_csv(client, b"\xff", "positions.csv")
+
+    assert response.status_code == 422
+    assert 'action="/imports/preview"' in response.text
+    assert 'type="file"' in response.text
+    assert 'action="/imports/confirm"' not in response.text
 
 
 def test_confirm_validation_error_writes_nothing_and_is_editable(
@@ -295,6 +314,31 @@ def test_confirm_validation_error_writes_nothing_and_is_editable(
     db_session.expire_all()
     assert db_session.scalar(select(Transaction)) is None
     assert db_session.scalar(select(ImportBatch)) is None
+
+
+def test_confirm_rejects_available_cash_without_writing_any_import_records(
+    client: TestClient, db_session
+) -> None:
+    login(client)
+    content = "基金代码,基金名称,份额,持仓成本,可用现金,日期\n000001,示例基金,1,10.00,25.00,2026-09-23\n".encode()
+    digest = hashlib.sha256(content).hexdigest()
+    assert upload_csv(client, content).status_code == 200
+    account_id = db_session.scalar(select(Account.id))
+    audit_count = len(db_session.scalars(select(AuditEvent)).all())
+    data = confirmation_data(digest, account_id)
+    data["csrf_token"] = csrf(client, "/imports")
+    data["rows-0-available_cash"] = "25.00"
+
+    response = client.post("/imports/confirm", data=data)
+
+    assert response.status_code == 422
+    assert "不能从持仓快照自动写入现金" in response.text
+    assert "清空" in response.text
+    assert "手工记录" in response.text
+    db_session.expire_all()
+    assert db_session.scalars(select(Transaction)).all() == []
+    assert db_session.scalars(select(ImportBatch)).all() == []
+    assert len(db_session.scalars(select(AuditEvent)).all()) == audit_count
 
 
 def test_confirm_rolls_back_every_row_when_a_later_post_fails(
@@ -383,6 +427,69 @@ def test_ocr_preview_is_candidate_only(
     assert "requires confirmation" in response.text.lower()
     assert response.text.count('role="status"') == 1
     assert "OCR 置信度 87.5%" in response.text
+    db_session.expire_all()
+    assert db_session.scalar(select(Transaction)) is None
+    assert db_session.scalar(select(ImportBatch)) is None
+
+
+def test_ocr_validation_error_preserves_trusted_preview_metadata_and_edits(
+    client: TestClient, db_session, monkeypatch
+) -> None:
+    login(client)
+    source_text = "基金代码 000001\n基金名称 OCR基金\n份额 1"
+    monkeypatch.setattr(
+        "finance_app.imports.routes.extract_candidates",
+        lambda _: type(
+            "Preview",
+            (),
+            {
+                "values": {
+                    "asset_code": "000001",
+                    "asset_name": "OCR基金",
+                    "quantity": "1",
+                },
+                "candidates": [SimpleNamespace(confidence=87.5)],
+                "source_text": source_text,
+                "requires_confirmation": True,
+                "persisted_transactions": 0,
+            },
+        )(),
+    )
+    content = b"fake-image"
+    digest = hashlib.sha256(content).hexdigest()
+    assert upload_csv(client, content, "screenshot.png").status_code == 200
+    account_id = db_session.scalar(select(Account.id))
+
+    response = client.post(
+        "/imports/confirm",
+        data={
+            "csrf_token": csrf(client, "/imports"),
+            "sha256": digest,
+            "account_id": str(account_id),
+            "requires_confirmation": "false",
+            "source_text": "forged overall source",
+            "rows-0-asset_code": "000001",
+            "rows-0-asset_name": "用户修正名称",
+            "rows-0-quantity": "1e2",
+            "rows-0-cost": "10.00",
+            "rows-0-market_value": "",
+            "rows-0-available_cash": "",
+            "rows-0-date": "2026-09-23",
+            "rows-0-source_text": "forged row source",
+            "rows-0-confidence": "1.0",
+            "rows-0-requires_confirmation": "false",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "用户修正名称" in response.text
+    assert 'name="rows-0-quantity" value="1e2"' in response.text
+    assert "validation-errors" in response.text
+    assert source_text in response.text
+    assert "OCR 置信度 87.5%" in response.text
+    assert "requires confirmation" in response.text.lower()
+    assert "forged overall source" not in response.text
+    assert "forged row source" not in response.text
     db_session.expire_all()
     assert db_session.scalar(select(Transaction)) is None
     assert db_session.scalar(select(ImportBatch)) is None
