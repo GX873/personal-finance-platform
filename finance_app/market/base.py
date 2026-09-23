@@ -5,23 +5,21 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Protocol
 
+MAX_NAV = Decimal(1000000)
+
 
 def validate_storable_nav(value: Decimal) -> None:
-    """Require an exact positive value within Numeric(24, 8)."""
-    if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
-        raise ValueError("NAV must be a finite positive Decimal")
-    digits = list(value.as_tuple().digits)
-    exponent_value = value.as_tuple().exponent
-    if not isinstance(exponent_value, int):
-        raise TypeError("finite NAV exponent must be an integer")
-    exponent = exponent_value
-    while digits and digits[-1] == 0:
-        digits.pop()
-        exponent += 1
-    fractional_digits = max(-exponent, 0)
-    integer_digits = max(len(digits) + exponent, 0)
-    if fractional_digits > 8 or integer_digits > 16:
-        raise ValueError("NAV must be exactly representable as Numeric(24, 8)")
+    """Apply the SQLite-safe decimal boundary shared with ledger quantities."""
+    if (
+        not isinstance(value, Decimal)
+        or not value.is_finite()
+        or value <= 0
+        or value > MAX_NAV
+        or int(value.as_tuple().exponent) < -8
+    ):
+        raise ValueError(
+            "NAV must be finite, positive, <= 1000000 with <= 8 places"
+        )
 
 
 @dataclass(frozen=True)

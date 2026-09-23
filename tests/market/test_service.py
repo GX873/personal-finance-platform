@@ -217,7 +217,7 @@ def test_valid_eight_decimal_nav_survives_commit_expire_and_new_session():
     engine = session.get_bind()
     try:
         exact_quote = FundNavQuote(
-            value=Decimal("1.23456789"),
+            value=Decimal("1000000.00000000"),
             valuation_date=date(2026, 9, 22),
             source="eastmoney",
             source_url=SOURCE_URL,
@@ -229,7 +229,9 @@ def test_valid_eight_decimal_nav_survives_commit_expire_and_new_session():
         assert result.status is RefreshStatus.SUCCESS
         session.commit()
         session.expire_all()
-        assert session.scalar(select(PriceSnapshot.price)) == Decimal("1.23456789")
+        assert session.scalar(select(PriceSnapshot.price)) == Decimal(
+            "1000000.00000000"
+        )
         asset_id = asset.id
     finally:
         session.close()
@@ -239,11 +241,18 @@ def test_valid_eight_decimal_nav_survives_commit_expire_and_new_session():
             select(PriceSnapshot).where(PriceSnapshot.asset_id == asset_id)
         )
         assert snapshot is not None
-        assert snapshot.price == Decimal("1.23456789")
+        assert snapshot.price == Decimal("1000000.00000000")
 
 
-@pytest.mark.parametrize("raw_nav", ["0.000000001", "10000000000000000"])
-def test_unrepresentable_nav_fails_without_replacing_last_good(raw_nav: str):
+@pytest.mark.parametrize(
+    "raw_nav",
+    [
+        "0.000000001",
+        "1000000.00000001",
+        "9999999999999999.99999999",
+    ],
+)
+def test_sqlite_unsafe_nav_fails_without_replacing_last_good(raw_nav: str):
     session, asset = setup_session()
     engine = session.get_bind()
     try:
