@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in | Personal Finance</title></head>
+<body>
+<main>
+  <h1>Personal Finance</h1>
+  {% if development %}<p>Local development mode</p>{% endif %}
+  {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/login">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p><label>Username <input name="username" autocomplete="username" required></label></p>
+    <p><label>Password <input type="password" name="password" autocomplete="current-password" required></label></p>
+    <button type="submit">Sign in</button>
+  </form>
+</main>
+</body>
+</html>

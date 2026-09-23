@@ -31,6 +31,12 @@ dev = [
     "mypy",
 ]
 
+[project.scripts]
+finance = "finance_app.cli:main"
+
+[tool.setuptools.package-data]
+finance_app = ["templates/*.html", "static/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
