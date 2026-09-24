@@ -11,6 +11,12 @@ def read(name: str) -> str:
     return (DEPLOY / name).read_text(encoding="utf-8")
 
 
+def test_linux_deployment_artifacts_are_exported_with_lf_line_endings() -> None:
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "deploy/** text eol=lf" in attributes
+    assert "scripts/*.sh text eol=lf" in attributes
+
+
 def test_application_binds_loopback_and_uses_hardened_service() -> None:
     unit = read("finance-app.service")
     assert "User=financeapp" in unit
