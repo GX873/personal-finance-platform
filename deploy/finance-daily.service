@@ -1,0 +1,20 @@
+[Unit]
+Description=Personal finance scheduled daily check
+After=network-online.target finance-app.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=financeapp
+Group=financeapp
+WorkingDirectory=/opt/personal-finance/current
+EnvironmentFile=/etc/personal-finance/finance.env
+ExecStart=/opt/personal-finance/current/.venv/bin/finance daily-check --scheduled
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/personal-finance/data
+ReadWritePaths=/var/lib/personal-finance/uploads
+MemoryMax=300M
+UMask=0077
