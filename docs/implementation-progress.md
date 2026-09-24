@@ -15,7 +15,7 @@ Updated: 2026-09-24
 - [x] Task 11: Audited email and WeChat notifications; reviewed at 48c1968 (350 tests).
 - [x] Task 12: Daily checks and settings; reviewed at 29f9514 (399 tests).
 - [x] Task 13: Exports, backups and restore verification; reviewed at 5b785f7 (416 tests).
-- [ ] Task 14: Ubuntu deployment artifacts.
+- [x] Task 14: Ubuntu deployment artifacts; reviewed at 37145ab (426 tests; bash -n deferred to Ubuntu because local WSL lacks /bin/bash).
 - [ ] Task 15: Release checks and operating documentation.
 - [ ] Task 16: Server deployment and acceptance.
 
