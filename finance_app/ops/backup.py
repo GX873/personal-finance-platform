@@ -122,6 +122,11 @@ def _sidecar(path: Path) -> Path:
     return path.with_name(path.name + ".sha256")
 
 
+def _remove_sqlite_auxiliary_files(path: Path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
 def _read_expected_checksum(path: Path) -> str | None:
     sidecar = _sidecar(path)
     if not sidecar.exists():
@@ -266,6 +271,7 @@ def create_backup(
             source_db.backup(target_db)
             target_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             target_db.commit()
+            target_db.execute("PRAGMA journal_mode=DELETE")
         finally:
             target_db.close()
             source_db.close()
@@ -299,10 +305,12 @@ def create_backup(
         if published:
             target.unlink(missing_ok=True)
             _sidecar(target).unlink(missing_ok=True)
+            _remove_sqlite_auxiliary_files(target)
         raise
     finally:
         temporary.unlink(missing_ok=True)
         temporary_sidecar.unlink(missing_ok=True)
+        _remove_sqlite_auxiliary_files(temporary)
 
 
 def restore_check(path: str | Path, *, session: Session | None = None) -> BackupVerification:

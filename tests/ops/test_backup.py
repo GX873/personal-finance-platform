@@ -30,11 +30,16 @@ def fixed_clock() -> datetime:
 
 
 def test_backup_passes_integrity_and_application_schema(populated_db: Path, tmp_path: Path):
-    backup = create_backup(populated_db, tmp_path / "backups")
+    directory = tmp_path / "backups"
+    backup = create_backup(populated_db, directory)
     result = verify_backup(backup, require_checksum=True)
     assert result.integrity_check == "ok"
     assert result.schema_valid is True
     assert result.schema_revision == "0002"
+    assert {path.name for path in directory.iterdir()} == {
+        backup.name,
+        f"{backup.name}.sha256",
+    }
 
 
 def test_restore_check_rejects_non_application_schema(tmp_path: Path):
