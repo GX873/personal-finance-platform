@@ -149,7 +149,9 @@ def verify_backup(path: str | Path, *, require_checksum: bool = False) -> Backup
         raise ValueError("backup checksum sidecar is missing")
     db = None
     try:
-        db = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
+        db = sqlite3.connect(
+            f"file:{candidate.as_posix()}?mode=ro&immutable=1", uri=True
+        )
         integrity_rows = [str(row[0]).lower() for row in db.execute("PRAGMA integrity_check")]
         integrity = "ok" if integrity_rows == ["ok"] else "; ".join(integrity_rows)
         table_columns = {

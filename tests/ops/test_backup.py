@@ -42,6 +42,23 @@ def test_backup_passes_integrity_and_application_schema(populated_db: Path, tmp_
     }
 
 
+def test_verifying_legacy_wal_backup_does_not_create_auxiliary_files(
+    populated_db: Path, tmp_path: Path
+):
+    backup = create_backup(populated_db, tmp_path / "backups")
+    with sqlite3.connect(backup) as db:
+        assert db.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    backup.with_name(f"{backup.name}.sha256").write_text(
+        f"{hashlib.sha256(backup.read_bytes()).hexdigest()}  {backup.name}\n",
+        encoding="ascii",
+    )
+
+    verify_backup(backup, require_checksum=True)
+
+    assert not Path(f"{backup}-wal").exists()
+    assert not Path(f"{backup}-shm").exists()
+
+
 def test_restore_check_rejects_non_application_schema(tmp_path: Path):
     candidate = tmp_path / "finance-20260924-080000.sqlite3"
     with sqlite3.connect(candidate) as db:
