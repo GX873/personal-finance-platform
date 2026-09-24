@@ -130,7 +130,7 @@ def test_installer_publishes_a_clean_root_owned_git_release() -> None:
 def test_installer_relocks_existing_account_and_repairs_private_permissions() -> None:
     script = read("install.sh")
     assert "usermod --shell /usr/sbin/nologin" in script
-    assert "--home-dir \"$STATE_ROOT\"" in script
+    assert "--home \"$STATE_ROOT\"" in script
     assert "--lock financeapp" in script
     assert 'chmod 0600 "$ENV_FILE"' in script
     for directory in ("data", "backups", "uploads"):

@@ -57,7 +57,7 @@ if ! id financeapp >/dev/null 2>&1; then
     useradd --system --user-group --home-dir "$STATE_ROOT" \
         --shell /usr/sbin/nologin financeapp
 fi
-usermod --shell /usr/sbin/nologin --home-dir "$STATE_ROOT" --lock financeapp
+usermod --shell /usr/sbin/nologin --home "$STATE_ROOT" --lock financeapp
 
 install -d -m 0755 "$RELEASE_ROOT" "$ENV_ROOT" \
     "$STATE_ROOT/data" "$STATE_ROOT/backups" "$STATE_ROOT/uploads" \
