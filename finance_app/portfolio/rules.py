@@ -28,7 +28,7 @@ class RuleContext:
     holdings_fresh: bool = False
     cash_fresh: bool = False
     required_reserve_cents: int = 100000
-    month_budget_remaining_cents: int = 20000
+    month_budget_remaining_cents: int | None = None
     source: str = "confirmed-data"
     timestamp: datetime = field(default_factory=utc_now)
 
@@ -48,11 +48,8 @@ class RuleContext:
                 type(value) is not int or not 0 <= value <= 2**63 - 1
             ):
                 raise ValueError("money must be nonnegative integer cents")
-        if (
-            self.required_reserve_cents is None
-            or self.month_budget_remaining_cents is None
-        ):
-            raise ValueError("reserve requirement and budget are required")
+        if self.required_reserve_cents is None:
+            raise ValueError("reserve requirement is required")
         aware(self.timestamp)
         if not self.source.strip():
             raise ValueError("source is required")
@@ -98,8 +95,10 @@ def evaluate_new_investment(
     aware(reference)
     if (
         context.timestamp > reference
+        or not context.cash_fresh
         or context.reserve_cents is None
         or context.investment_cash_cents is None
+        or context.month_budget_remaining_cents is None
         or not all((context.prices_fresh, context.holdings_fresh, context.cash_fresh))
     ):
         return _advice(
@@ -132,6 +131,27 @@ def evaluate_new_investment(
         amount,
         "CONDITIONAL_BUY",
         "仅在数据仍有效且人工确认风险后，可考虑不超过此金额的买入；不会自动下单。",
+    )
+
+
+def evaluate_reserve_shortfall(
+    context: RuleContext, *, now: datetime | None = None
+) -> Advice | None:
+    reference = now if now is not None else utc_now()
+    aware(reference)
+    if (
+        context.timestamp > reference
+        or not context.cash_fresh
+        or context.reserve_cents is None
+        or context.reserve_cents >= context.required_reserve_cents
+    ):
+        return None
+    return _advice(
+        context,
+        AdviceAction.WAIT,
+        0,
+        "RESERVE_SHORTFALL",
+        "备用金未达标，暂停新增投资。",
     )
 
 

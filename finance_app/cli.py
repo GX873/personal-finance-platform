@@ -23,8 +23,10 @@ from finance_app.ledger.models import (
     Asset,
     CashBucket,
     Holding,
+    MonthlyBudget,
     PortfolioRole,
     RiskLevel,
+    Transaction,
 )
 from finance_app.market.eastmoney import EastMoneyFundNavProvider
 from finance_app.market.service import FundPriceService
@@ -49,6 +51,7 @@ from finance_app.portfolio.rules import (
     RuleContext,
     evaluate_allocation,
     evaluate_new_investment,
+    evaluate_reserve_shortfall,
     nav_is_fresh,
 )
 from finance_app.portfolio.service import create_daily_snapshot
@@ -362,7 +365,51 @@ class DailyCheck:
             ),
         )
 
-    def _rule_context(self, freshness: dict[str, Any]) -> RuleContext:
+    def _monthly_investment_remaining(self, business_date: date) -> int | None:
+        rows = list(
+            self.session.scalars(
+                select(MonthlyBudget).where(
+                    MonthlyBudget.month == business_date.strftime("%Y-%m")
+                )
+            )
+        )
+        amounts = {row.bucket_kind: row.amount_cents for row in rows}
+        expected = {kind.value for kind in BucketKind}
+        if set(amounts) != expected or any(
+            type(amount) is not int or not 0 <= amount <= 2**63 - 1
+            for amount in amounts.values()
+        ):
+            return None
+        month_start = datetime(
+            business_date.year, business_date.month, 1, tzinfo=SHANGHAI
+        )
+        next_month = (month_start + timedelta(days=32)).replace(day=1)
+        reversed_ids = set(
+            self.session.scalars(
+                select(Transaction.reverses_transaction_id).where(
+                    Transaction.reverses_transaction_id.is_not(None)
+                )
+            )
+        )
+        buys = self.session.scalars(
+            select(Transaction).where(
+                Transaction.kind == "BUY",
+                Transaction.reverses_transaction_id.is_(None),
+                Transaction.occurred_at >= month_start,
+                Transaction.occurred_at < next_month,
+            )
+        )
+        used = sum(
+            row.amount_cents + row.fee_cents
+            for row in buys
+            if row.id not in reversed_ids
+        )
+        return max(0, amounts[BucketKind.INVESTMENT.value] - used)
+
+    def _rule_context(
+        self, freshness: dict[str, Any], business_date: date | None = None
+    ) -> RuleContext:
+        business_date = business_date or self.clock().astimezone(SHANGHAI).date()
         buckets = {
             row.bucket_kind: row.balance_cents
             for row in self.session.scalars(select(CashBucket))
@@ -374,13 +421,17 @@ class DailyCheck:
             holdings_fresh=freshness["holdings_fresh"],
             cash_fresh=freshness["cash_fresh"],
             required_reserve_cents=int(self._setting("reserve_target_cents", "100000")),
-            month_budget_remaining_cents=20000,
+            month_budget_remaining_cents=self._monthly_investment_remaining(
+                business_date
+            ),
             source=",".join(freshness["sources"]) or "confirmed-ledger",
             timestamp=freshness["as_of"],
         )
 
-    def default_advice(self, freshness: dict[str, Any]) -> list[Advice]:
-        context = self._rule_context(freshness)
+    def default_advice(
+        self, freshness: dict[str, Any], business_date: date | None = None
+    ) -> list[Advice]:
+        context = self._rule_context(freshness, business_date)
         return [evaluate_new_investment(context, RiskLevel.HIGH, now=self.clock())]
 
     def evaluate_rules(
@@ -389,10 +440,20 @@ class DailyCheck:
         complete = snapshot is not None and snapshot.data_complete
         effective_freshness = dict(freshness)
         if not complete:
-            effective_freshness.update(
-                prices_fresh=False, holdings_fresh=False, cash_fresh=False
-            )
-        advice = self.default_advice(effective_freshness)
+            effective_freshness.update(prices_fresh=False, holdings_fresh=False)
+        business_date = (
+            snapshot.snapshot_date
+            if snapshot is not None
+            else self.clock().astimezone(SHANGHAI).date()
+        )
+        advice = self.default_advice(effective_freshness, business_date)
+        reserve_advice = evaluate_reserve_shortfall(
+            self._rule_context(freshness, business_date), now=self.clock()
+        )
+        if reserve_advice is not None and not any(
+            item.reason_code == "RESERVE_SHORTFALL" for item in advice
+        ):
+            advice.append(reserve_advice)
         if (
             snapshot is None
             or not snapshot.data_complete
@@ -410,7 +471,7 @@ class DailyCheck:
             row.name: row
             for row in self.session.scalars(select(AllocationTarget)).all()
         }
-        context = self._rule_context(effective_freshness)
+        context = self._rule_context(effective_freshness, business_date)
         role_values = {PortfolioRole.CORE.value: 0, PortfolioRole.SATELLITE.value: 0}
         satellite_positions: dict[int, int] = {}
         for item in holdings:

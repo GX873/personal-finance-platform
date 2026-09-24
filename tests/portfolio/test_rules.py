@@ -16,7 +16,15 @@ NOW = datetime(2026, 9, 21, 8, tzinfo=timezone(timedelta(hours=8)))
 
 
 def context():
-    return RuleContext(100000, 20000, True, True, True, timestamp=NOW)
+    return RuleContext(
+        100000,
+        20000,
+        True,
+        True,
+        True,
+        month_budget_remaining_cents=20000,
+        timestamp=NOW,
+    )
 
 
 @pytest.mark.parametrize("field", ["reserve_cents", "investment_cash_cents"])

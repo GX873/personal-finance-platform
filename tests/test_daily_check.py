@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 from sqlalchemy import select, update
 
 from finance_app.cli import DailyCheck, DailyCheckResult, main
-from finance_app.ledger.models import Asset, CashBucket, PortfolioRole
+from finance_app.ledger.models import (
+    Account,
+    Asset,
+    CashBucket,
+    MonthlyBudget,
+    PortfolioRole,
+    Transaction,
+)
 from finance_app.notifications.base import DeliveryResult, DeliveryStatus, Notification
 from finance_app.notifications.models import (
     AppSetting,
@@ -80,6 +88,24 @@ class NoNetworkDailyCheck(DailyCheck):
         return []
 
     def notify(self, notification, *, critical=False):
+        return DeliveryStatus.SUCCESS
+
+
+class RealRuleRecordingDailyCheck(DailyCheck):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.advice: list[Advice] = []
+        self.notifications: list[tuple[str, bool]] = []
+
+    def refresh_prices(self, business_date):
+        return []
+
+    def evaluate_rules(self, snapshot, freshness):
+        self.advice = super().evaluate_rules(snapshot, freshness)
+        return self.advice
+
+    def notify(self, notification, *, critical=False):
+        self.notifications.append((notification.title, critical))
         return DeliveryStatus.SUCCESS
 
 
@@ -337,6 +363,396 @@ def test_incomplete_snapshot_forces_wait_even_if_threshold_flags_are_true(db_ses
     )
     assert "账本记录，待确认" in digest.body
     assert "（有效）" not in digest.body
+
+
+def test_missing_monthly_budget_prohibits_buy_advice(db_session):
+    db_session.add_all(
+        [
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=NOW),
+        ]
+    )
+    db_session.flush()
+    snapshot = PortfolioSnapshot(
+        snapshot_date=date(2026, 9, 23),
+        total_value_cents=120_000,
+        known_value_cents=120_000,
+        invested_value_cents=1,
+        cash_value_cents=119_999,
+        data_complete=True,
+        details_json='{"holdings":[]}',
+    )
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:statement"],
+    }
+
+    advice = DailyCheck(db_session, clock=lambda: NOW).evaluate_rules(
+        snapshot, freshness
+    )
+
+    assert advice[0].action is AdviceAction.WAIT_FOR_DATA
+
+
+def test_incomplete_monthly_budget_prohibits_buy_advice(db_session):
+    db_session.add_all(
+        [
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=NOW),
+            MonthlyBudget(
+                month="2026-09", bucket_kind="investment", amount_cents=20_000
+            ),
+        ]
+    )
+    db_session.flush()
+    snapshot = PortfolioSnapshot(
+        snapshot_date=date(2026, 9, 23),
+        total_value_cents=120_000,
+        known_value_cents=120_000,
+        invested_value_cents=1,
+        cash_value_cents=119_999,
+        data_complete=True,
+        details_json='{"holdings":[]}',
+    )
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:statement"],
+    }
+
+    advice = DailyCheck(db_session, clock=lambda: NOW).evaluate_rules(
+        snapshot, freshness
+    )
+
+    assert advice[0].action is AdviceAction.WAIT_FOR_DATA
+
+
+def test_monthly_budget_remaining_deducts_buy_amount_and_fee(db_session):
+    account = Account(name="Broker", kind="investment")
+    asset = Asset(code="BUDGET", market="CN", name="Budget test")
+    db_session.add_all(
+        [
+            account,
+            asset,
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(
+                bucket_kind="investment", balance_cents=100_000, updated_at=NOW
+            ),
+        ]
+    )
+    db_session.flush()
+    db_session.add_all(
+        [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+        + [
+            Transaction(
+                source="test",
+                external_id="september-buy",
+                kind="BUY",
+                account_id=account.id,
+                asset_id=asset.id,
+                amount_cents=6_000,
+                quantity=Decimal(1),
+                fee_cents=250,
+                occurred_at=datetime(2026, 9, 10, tzinfo=UTC),
+            )
+        ]
+    )
+    db_session.flush()
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:statement"],
+    }
+
+    snapshot = PortfolioSnapshot(
+        snapshot_date=date(2026, 9, 23),
+        total_value_cents=200_000,
+        known_value_cents=200_000,
+        invested_value_cents=1,
+        cash_value_cents=199_999,
+        data_complete=True,
+        details_json='{"holdings":[]}',
+    )
+    advice = DailyCheck(db_session, clock=lambda: NOW).evaluate_rules(
+        snapshot, freshness
+    )
+
+    assert advice[0].action is AdviceAction.BUY
+    assert advice[0].amount_cents == 13_750
+
+
+def test_monthly_budget_remaining_stops_at_zero_when_exhausted(db_session):
+    account = Account(name="Broker", kind="investment")
+    asset = Asset(code="EXHAUSTED", market="CN", name="Exhausted budget")
+    db_session.add_all(
+        [
+            account,
+            asset,
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(
+                bucket_kind="investment", balance_cents=100_000, updated_at=NOW
+            ),
+        ]
+    )
+    db_session.flush()
+    db_session.add_all(
+        [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 5_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+        + [
+            Transaction(
+                source="test",
+                external_id="overspent-buy",
+                kind="BUY",
+                account_id=account.id,
+                asset_id=asset.id,
+                amount_cents=6_000,
+                quantity=Decimal(1),
+                fee_cents=250,
+                occurred_at=datetime(2026, 9, 10, tzinfo=UTC),
+            )
+        ]
+    )
+    db_session.flush()
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:statement"],
+    }
+
+    snapshot = PortfolioSnapshot(
+        snapshot_date=date(2026, 9, 23),
+        total_value_cents=200_000,
+        known_value_cents=200_000,
+        invested_value_cents=1,
+        cash_value_cents=199_999,
+        data_complete=True,
+        details_json='{"holdings":[]}',
+    )
+    advice = DailyCheck(db_session, clock=lambda: NOW).evaluate_rules(
+        snapshot, freshness
+    )
+
+    assert advice[0].action is AdviceAction.WAIT
+    assert advice[0].amount_cents == 0
+
+
+def test_monthly_budget_usage_excludes_reversed_buys(db_session):
+    account = Account(name="Broker", kind="investment")
+    asset = Asset(code="REVERSED", market="CN", name="Reversed buy")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    original = Transaction(
+        source="test",
+        external_id="reversed-buy",
+        kind="BUY",
+        account_id=account.id,
+        asset_id=asset.id,
+        amount_cents=6_000,
+        quantity=Decimal(1),
+        fee_cents=250,
+        occurred_at=datetime(2026, 9, 10, tzinfo=UTC),
+    )
+    db_session.add(original)
+    db_session.flush()
+    db_session.add_all(
+        [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+        + [
+            Transaction(
+                source="test",
+                external_id="reversal",
+                kind="BUY",
+                account_id=account.id,
+                asset_id=asset.id,
+                amount_cents=6_000,
+                quantity=Decimal(1),
+                fee_cents=250,
+                occurred_at=datetime(2026, 9, 11, tzinfo=UTC),
+                reverses_transaction_id=original.id,
+            )
+        ]
+    )
+    db_session.flush()
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:statement"],
+    }
+
+    context = DailyCheck(db_session, clock=lambda: NOW)._rule_context(
+        freshness, date(2026, 9, 23)
+    )
+
+    assert context.month_budget_remaining_cents == 20_000
+
+
+def test_monthly_budget_uses_shanghai_month_boundaries(db_session):
+    account = Account(name="Broker", kind="investment")
+    asset = Asset(code="BOUNDARY", market="CN", name="Boundary buys")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add_all(
+        [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+        + [
+            Transaction(
+                source="test",
+                external_id="shanghai-september",
+                kind="BUY",
+                account_id=account.id,
+                asset_id=asset.id,
+                amount_cents=3_000,
+                quantity=Decimal(1),
+                fee_cents=0,
+                occurred_at=datetime(2026, 8, 31, 16, 30, tzinfo=UTC),
+            ),
+            Transaction(
+                source="test",
+                external_id="shanghai-october",
+                kind="BUY",
+                account_id=account.id,
+                asset_id=asset.id,
+                amount_cents=7_000,
+                quantity=Decimal(1),
+                fee_cents=0,
+                occurred_at=datetime(2026, 9, 30, 16, tzinfo=UTC),
+            ),
+        ]
+    )
+    db_session.flush()
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:statement"],
+    }
+
+    context = DailyCheck(db_session, clock=lambda: NOW)._rule_context(
+        freshness, date(2026, 9, 23)
+    )
+
+    assert context.month_budget_remaining_cents == 17_000
+
+
+def test_fresh_reserve_shortfall_survives_missing_holdings_and_alerts(db_session):
+    db_session.add_all(
+        [
+            CashBucket(bucket_kind="reserve", balance_cents=50_000, updated_at=NOW),
+            CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=NOW),
+        ]
+        + [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+    )
+    db_session.commit()
+    check = RealRuleRecordingDailyCheck(db_session, clock=lambda: NOW)
+
+    assert check.run(date(2026, 9, 23)) is DailyCheckResult.SUCCESS
+
+    assert [item.reason_code for item in check.advice] == [
+        "DATA_UNCONFIRMED",
+        "RESERVE_SHORTFALL",
+    ]
+    assert [item.action for item in check.advice] == [
+        AdviceAction.WAIT_FOR_DATA,
+        AdviceAction.WAIT,
+    ]
+    assert [critical for _title, critical in check.notifications] == [False, True]
+
+
+def test_stale_cash_does_not_fabricate_reserve_shortfall(db_session):
+    stale = NOW - timedelta(days=2)
+    db_session.add_all(
+        [
+            CashBucket(bucket_kind="reserve", balance_cents=50_000, updated_at=stale),
+            CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=stale),
+        ]
+        + [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+    )
+    db_session.commit()
+    check = RealRuleRecordingDailyCheck(db_session, clock=lambda: NOW)
+
+    assert check.run(date(2026, 9, 23)) is DailyCheckResult.SUCCESS
+
+    assert [item.reason_code for item in check.advice] == ["DATA_UNCONFIRMED"]
+    assert [critical for _title, critical in check.notifications] == [False]
+
+
+def test_unknown_reserve_does_not_fabricate_shortfall(db_session):
+    db_session.add_all(
+        [CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=NOW)]
+        + [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+    )
+    db_session.commit()
+    check = RealRuleRecordingDailyCheck(db_session, clock=lambda: NOW)
+
+    assert check.run(date(2026, 9, 23)) is DailyCheckResult.SUCCESS
+
+    assert [item.reason_code for item in check.advice] == ["DATA_UNCONFIRMED"]
+    assert [critical for _title, critical in check.notifications] == [False]
 
 
 def test_scheduled_outside_five_minute_window_changes_nothing(db_session):
