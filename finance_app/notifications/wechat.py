@@ -70,7 +70,7 @@ class WeChatNotifier:
                 credential = SecretStr(validate_wecom_webhook_url_value(raw))
         self.provider = provider
         self._credential = credential
-        self._client = client if client is not None else httpx.Client()
+        self._client = client
 
     def send(self, notification: Notification) -> DeliveryResult:
         if self._credential is None:
@@ -84,7 +84,12 @@ class WeChatNotifier:
             )
 
         try:
-            response = self._post(notification, self._credential.get_secret_value())
+            credential = self._credential.get_secret_value()
+            if self._client is None:
+                with httpx.Client() as client:
+                    response = self._post(client, notification, credential)
+            else:
+                response = self._post(self._client, notification, credential)
         except httpx.TimeoutException:
             return DeliveryResult.failed(
                 provider=self.provider,
@@ -127,9 +132,14 @@ class WeChatNotifier:
             retryable=False,
         )
 
-    def _post(self, notification: Notification, credential: str) -> httpx.Response:
+    def _post(
+        self,
+        client: httpx.Client,
+        notification: Notification,
+        credential: str,
+    ) -> httpx.Response:
         if self.provider == "pushplus":
-            return self._client.post(
+            return client.post(
                 PUSHPLUS_URL,
                 json={
                     "token": credential,
@@ -140,12 +150,12 @@ class WeChatNotifier:
                 timeout=TIMEOUT,
             )
         if self.provider == "serverchan":
-            return self._client.post(
+            return client.post(
                 SERVERCHAN_URL.format(sendkey=credential),
                 data={"title": notification.title, "desp": notification.body},
                 timeout=TIMEOUT,
             )
-        return self._client.post(
+        return client.post(
             credential,
             json={
                 "msgtype": "text",

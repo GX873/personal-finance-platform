@@ -79,6 +79,19 @@ class NotificationDeliveryService:
             self._session.flush()
         assert channel.id is not None
 
+        if not channel.enabled:
+            delivery = NotificationDelivery(
+                channel_id=channel.id,
+                title=notification.title,
+                status=DeliveryStatus.SKIPPED.value,
+                attempt_count=0,
+                error_summary=None,
+                created_at=self._clock(),
+            )
+            self._session.add(delivery)
+            self._session.flush()
+            return DeliveryResult.skipped(provider=notifier.provider)
+
         delivery = NotificationDelivery(
             channel_id=channel.id,
             title=notification.title,

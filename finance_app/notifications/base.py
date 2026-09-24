@@ -12,6 +12,7 @@ _ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 class DeliveryStatus(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
+    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,16 @@ class DeliveryResult:
     def __post_init__(self) -> None:
         if _PROVIDER.fullmatch(self.provider) is None:
             raise ValueError("delivery provider is invalid")
+        if self.status is DeliveryStatus.SKIPPED:
+            if (
+                self.attempt_count != 0
+                or self.retryable
+                or self.error_code is not None
+                or self.error_summary is not None
+                or self.http_status is not None
+            ):
+                raise ValueError("skipped delivery cannot contain attempts or errors")
+            return
         if type(self.attempt_count) is not int or self.attempt_count < 1:
             raise ValueError("attempt_count must be a positive integer")
         if self.status is DeliveryStatus.SUCCESS:
@@ -67,6 +78,14 @@ class DeliveryResult:
     @classmethod
     def success(cls, *, provider: str) -> DeliveryResult:
         return cls(provider=provider, status=DeliveryStatus.SUCCESS)
+
+    @classmethod
+    def skipped(cls, *, provider: str) -> DeliveryResult:
+        return cls(
+            provider=provider,
+            status=DeliveryStatus.SKIPPED,
+            attempt_count=0,
+        )
 
     @classmethod
     def failed(

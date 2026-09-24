@@ -12,13 +12,14 @@ from finance_app.config import Settings
 from finance_app.db import Base, create_db_engine
 from finance_app.notifications.base import DeliveryStatus, Notification
 from finance_app.notifications.email import EmailNotifier
-from finance_app.notifications.models import NotificationChannel
+from finance_app.notifications.models import NotificationChannel, NotificationDelivery
 from finance_app.notifications.service import NotificationDeliveryService
 
 
 class FakeSMTP:
     instances: ClassVar[list[FakeSMTP]] = []
     login_error: ClassVar[Exception | None] = None
+    quit_error: ClassVar[Exception | None] = None
 
     def __init__(
         self, host: str, port: int, *, timeout: float, context: object | None = None
@@ -31,13 +32,16 @@ class FakeSMTP:
         self.starttls_context: object | None = None
         self.login_args: tuple[str, str] | None = None
         self.message: EmailMessage | None = None
+        self.quit_calls = 0
+        self.close_calls = 0
         type(self).instances.append(self)
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:
-        return None
+        if self.quit_error is not None:
+            raise self.quit_error
 
     def ehlo(self) -> None:
         self.ehlo_count += 1
@@ -53,11 +57,21 @@ class FakeSMTP:
     def send_message(self, message: EmailMessage) -> None:
         self.message = message
 
+    def quit(self) -> tuple[int, bytes]:
+        self.quit_calls += 1
+        if self.quit_error is not None:
+            raise self.quit_error
+        return 221, b"bye"
+
+    def close(self) -> None:
+        self.close_calls += 1
+
 
 @pytest.fixture(autouse=True)
 def reset_fake_smtp() -> None:
     FakeSMTP.instances.clear()
     FakeSMTP.login_error = None
+    FakeSMTP.quit_error = None
 
 
 @pytest.fixture
@@ -340,3 +354,38 @@ def test_temporary_recipient_refusal_retries_three_times_with_bounded_delays(
     assert len(FakeSMTP.instances) == 3
     assert sleeps == [1.0, 3.0]
     assert "smtp-secret-code" not in (result.error_summary or "")
+
+
+def test_accepted_message_is_success_when_quit_returns_temporary_error(
+    monkeypatch: pytest.MonkeyPatch, smtp_settings: Settings
+) -> None:
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.quit_error = smtplib.SMTPConnectError(
+        421, b"smtp-secret-code closing connection"
+    )
+    engine = create_db_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    sleeps: list[float] = []
+
+    with Session(engine) as session:
+        channel = NotificationChannel(name="Primary email", channel_type="email")
+        session.add(channel)
+        session.flush()
+        result = NotificationDeliveryService(
+            session, sleep=sleeps.append
+        ).deliver(
+            channel,
+            EmailNotifier(smtp_settings),
+            Notification("Digest", "Body"),
+        )
+        delivery = session.query(NotificationDelivery).one()
+
+    assert result.status is DeliveryStatus.SUCCESS
+    assert result.attempt_count == 1
+    assert len(FakeSMTP.instances) == 1
+    assert FakeSMTP.instances[0].message is not None
+    assert FakeSMTP.instances[0].quit_calls == 1
+    assert FakeSMTP.instances[0].close_calls == 1
+    assert sleeps == []
+    assert delivery.status == "success"
+    assert delivery.attempt_count == 1

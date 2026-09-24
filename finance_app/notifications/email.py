@@ -43,18 +43,19 @@ class EmailNotifier:
         message.set_content(notification.body)
         context = ssl.create_default_context()
 
+        client: smtplib.SMTP | None = None
         try:
             if self._security == "ssl":
-                with smtplib.SMTP_SSL(
+                client = smtplib.SMTP_SSL(
                     self._host, self._port, timeout=10.0, context=context
-                ) as client:
-                    self._authenticate_and_send(client, message)
+                )
+                self._authenticate_and_send(client, message)
             else:
-                with smtplib.SMTP(self._host, self._port, timeout=10.0) as client:
-                    client.ehlo()
-                    client.starttls(context=context)
-                    client.ehlo()
-                    self._authenticate_and_send(client, message)
+                client = smtplib.SMTP(self._host, self._port, timeout=10.0)
+                client.ehlo()
+                client.starttls(context=context)
+                client.ehlo()
+                self._authenticate_and_send(client, message)
         except smtplib.SMTPAuthenticationError:
             return DeliveryResult.failed(
                 provider=self.provider,
@@ -105,6 +106,9 @@ class EmailNotifier:
                 error_summary="transport_error: SMTP delivery failed",
                 retryable=True,
             )
+        finally:
+            if client is not None:
+                self._close(client)
 
         return DeliveryResult.success(provider=self.provider)
 
@@ -144,3 +148,13 @@ class EmailNotifier:
     @staticmethod
     def _is_temporary_status(status: object) -> bool:
         return type(status) is int and 400 <= status < 500
+
+    @staticmethod
+    def _close(client: smtplib.SMTP) -> None:
+        try:
+            client.quit()
+        except (OSError, smtplib.SMTPException):
+            try:
+                client.close()
+            except (OSError, smtplib.SMTPException):
+                pass

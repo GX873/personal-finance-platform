@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import Self
 from urllib.parse import unquote_plus
 
 import httpx
 import pytest
 from pydantic import SecretStr, ValidationError
+from sqlalchemy.orm import Session
 
 from finance_app.config import Settings
+from finance_app.db import Base, create_db_engine
 from finance_app.notifications.base import DeliveryStatus, Notification
+from finance_app.notifications.models import NotificationChannel
+from finance_app.notifications.service import NotificationDeliveryService
 from finance_app.notifications.wechat import WeChatNotifier, build_wechat_notifier
 
 
@@ -17,6 +22,27 @@ def make_client(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+class TrackingClient:
+    def __init__(self, outcome: httpx.Response | Exception) -> None:
+        self.outcome = outcome
+        self.entered = 0
+        self.closed = False
+        self.posts = 0
+
+    def __enter__(self) -> Self:
+        self.entered += 1
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.closed = True
+
+    def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
+        self.posts += 1
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
 
 
 @pytest.fixture
@@ -349,6 +375,93 @@ def test_unknown_wechat_provider_is_rejected_without_network() -> None:
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="unsupported WeChat provider"):
         build_wechat_notifier("https://evil.example/token", settings)
+
+
+def test_owned_http_client_is_closed_after_success(
+    monkeypatch: pytest.MonkeyPatch, wechat_env: None
+) -> None:
+    clients: list[TrackingClient] = []
+
+    def client_factory() -> TrackingClient:
+        client = TrackingClient(httpx.Response(200, json={"code": 200}))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    notifier = build_wechat_notifier("pushplus", Settings())
+
+    result = notifier.send(Notification("Digest", "Body"))
+
+    assert result.status is DeliveryStatus.SUCCESS
+    assert len(clients) == 1
+    assert clients[0].entered == 1
+    assert clients[0].closed is True
+
+
+def test_owned_http_client_is_closed_after_failure(
+    monkeypatch: pytest.MonkeyPatch, wechat_env: None
+) -> None:
+    clients: list[TrackingClient] = []
+
+    def client_factory() -> TrackingClient:
+        request = httpx.Request("POST", "https://www.pushplus.plus/send")
+        client = TrackingClient(httpx.ReadTimeout("secret", request=request))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    notifier = build_wechat_notifier("pushplus", Settings())
+
+    result = notifier.send(Notification("Digest", "Body"))
+
+    assert result.status is DeliveryStatus.FAILED
+    assert result.retryable is True
+    assert len(clients) == 1
+    assert clients[0].closed is True
+
+
+def test_owned_http_client_is_closed_for_each_service_retry(
+    monkeypatch: pytest.MonkeyPatch, wechat_env: None
+) -> None:
+    clients: list[TrackingClient] = []
+
+    def client_factory() -> TrackingClient:
+        client = TrackingClient(httpx.Response(503, text="secret"))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "Client", client_factory)
+    engine = create_db_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        channel = NotificationChannel(name="PushPlus", channel_type="pushplus")
+        session.add(channel)
+        session.flush()
+        result = NotificationDeliveryService(
+            session, sleep=lambda _seconds: None
+        ).deliver(
+            channel,
+            build_wechat_notifier("pushplus", Settings()),
+            Notification("Digest", "Body"),
+        )
+
+    assert result.status is DeliveryStatus.FAILED
+    assert result.attempt_count == 3
+    assert len(clients) == 3
+    assert all(client.closed for client in clients)
+
+
+def test_injected_http_client_is_never_closed(wechat_env: None) -> None:
+    client = TrackingClient(httpx.Response(200, json={"code": 200}))
+    notifier = build_wechat_notifier("pushplus", Settings(), client=client)  # type: ignore[arg-type]
+
+    result = notifier.send(Notification("Digest", "Body"))
+
+    assert result.status is DeliveryStatus.SUCCESS
+    assert client.posts == 1
+    assert client.entered == 0
+    assert client.closed is False
 
 
 @pytest.mark.parametrize(

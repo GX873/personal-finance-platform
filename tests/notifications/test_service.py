@@ -302,6 +302,66 @@ def test_email_success_remains_overall_success_when_wechat_fails() -> None:
         ]
 
 
+def test_disabled_channel_is_persisted_as_skipped_without_calling_notifier() -> None:
+    with setup_session() as session:
+        channel = NotificationChannel(
+            name="Disabled WeChat", channel_type="wecom", enabled=False
+        )
+        session.add(channel)
+        session.flush()
+        notifier = StubNotifier("wecom", [])
+
+        result = NotificationDeliveryService(session, clock=lambda: NOW).deliver(
+            channel, notifier, Notification("Digest", "Body")
+        )
+
+        row = session.scalar(select(NotificationDelivery))
+        assert result.status is DeliveryStatus.SKIPPED
+        assert result.attempt_count == 0
+        assert result.error_code is None
+        assert result.error_summary is None
+        assert notifier.calls == 0
+        assert row is not None
+        assert row.status == "skipped"
+        assert row.attempt_count == 0
+        assert row.error_summary is None
+        assert row.delivered_at is None
+
+
+def test_disabled_channel_does_not_affect_enabled_primary_channel() -> None:
+    with setup_session() as session:
+        email_channel = add_channel(session, "Primary email", "email")
+        wechat_channel = NotificationChannel(
+            name="Disabled WeChat", channel_type="wecom", enabled=False
+        )
+        session.add(wechat_channel)
+        session.flush()
+        email = StubNotifier("email", [DeliveryResult.success(provider="email")])
+        wechat = StubNotifier("wecom", [])
+
+        report = NotificationDeliveryService(session).deliver_channels(
+            Notification("Digest", "Body"),
+            {
+                "email": (email_channel, email),
+                "wechat": (wechat_channel, wechat),
+            },
+            primary_channel="email",
+        )
+
+        rows = session.scalars(
+            select(NotificationDelivery).order_by(NotificationDelivery.channel_id)
+        ).all()
+        assert report.status is DeliveryStatus.SUCCESS
+        assert report.results["email"].status is DeliveryStatus.SUCCESS
+        assert report.results["wechat"].status is DeliveryStatus.SKIPPED
+        assert email.calls == 1
+        assert wechat.calls == 0
+        assert [(row.channel_id, row.status, row.attempt_count) for row in rows] == [
+            (email_channel.id, "success", 1),
+            (wechat_channel.id, "skipped", 0),
+        ]
+
+
 def test_notification_value_object_rejects_empty_or_oversized_fields() -> None:
     for title, body in (
         ("", "Body"),
