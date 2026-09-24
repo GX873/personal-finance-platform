@@ -14,7 +14,7 @@ Updated: 2026-09-24
 - [x] Task 10: Traceable EastMoney fund NAV integration; reviewed at 4373e92 (269 tests).
 - [x] Task 11: Audited email and WeChat notifications; reviewed at 48c1968 (350 tests).
 - [x] Task 12: Daily checks and settings; reviewed at 29f9514 (399 tests).
-- [ ] Task 13: Exports, backups and restore verification.
+- [x] Task 13: Exports, backups and restore verification; reviewed at 5b785f7 (416 tests).
 - [ ] Task 14: Ubuntu deployment artifacts.
 - [ ] Task 15: Release checks and operating documentation.
 - [ ] Task 16: Server deployment and acceptance.
