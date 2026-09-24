@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}偏好设置{% endblock %}
+{% block eyebrow %}SETTINGS{% endblock %}
+{% block heading %}规则清楚，提醒才可信。{% endblock %}
+{% block subtitle %}这里只保存非敏感偏好；通知凭据只能通过服务器环境变量配置。{% endblock %}
+{% block content %}
+{% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+<div class="form-grid">
+  <section class="panel">
+    <div class="section-heading"><h2>每日检查与组合边界</h2><span class="pill">北京时间</span></div>
+    <form class="manual-form" method="post" action="/settings">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>每日检查时间<input required name="daily_schedule" type="time" value="{{ values.daily_schedule }}"></label>
+      <label>流动储备金目标（元）<input required inputmode="decimal" name="reserve_target" value="{{ values.reserve_target }}"></label>
+      <label>核心资产目标（%）<input required inputmode="decimal" name="core_target_percent" value="{{ values.core_target_percent }}"></label>
+      <label>卫星资产目标（%）<input required inputmode="decimal" name="satellite_target_percent" value="{{ values.satellite_target_percent }}"></label>
+      <label>单一卫星资产上限（%）<input required inputmode="decimal" name="satellite_upper_percent" value="{{ values.satellite_upper_percent }}"></label>
+      <label>数据陈旧阈值（小时）<input required inputmode="numeric" name="stale_threshold_hours" value="{{ values.stale_threshold_hours }}"></label>
+      <fieldset><legend>启用通知通道</legend>
+      {% for name,label,channel_type in channels %}
+        <label><input type="checkbox" name="enabled_channels" value="{{ name }}" {{ 'checked' if name in values.enabled_channels }}>{{ label }}</label>
+      {% endfor %}
+      </fieldset>
+      <button type="submit">保存非敏感设置</button>
+    </form>
+  </section>
+  <section class="panel">
+    <div class="section-heading"><h2>环境凭据状态</h2><span class="pill">只读</span></div>
+    <p class="hint">页面不接收、不保存、也不回显任何授权码、Token 或 Webhook。</p>
+    <ul class="record-list">
+    {% for name,label,channel_type in channels %}
+      <li><strong>{{ label }}</strong><span>{{ '已配置' if credential_statuses[channel_type] else '未配置' }}</span></li>
+    {% endfor %}
+    </ul>
+    <p class="hint">默认月度规则：4,000 元工资拆分为固定支出 2,700 元、流动储备 1,000 元、投资预算 200 元、自由支配 100 元。储备金不会作为高波动资产的可投资现金。</p>
+  </section>
+</div>
+{% endblock %}

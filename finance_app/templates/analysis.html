@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}投资分析{% endblock %}
+{% block eyebrow %}ANALYSIS{% endblock %}
+{% block heading %}先确认数据，再讨论行动。{% endblock %}
+{% block subtitle %}缺失或陈旧的数据只产生条件式建议，系统不推测行情，也不自动交易。{% endblock %}
+{% block content %}
+<div class="form-grid">
+  <section class="panel">
+    <div class="section-heading"><h2>最近每日快照</h2><span class="pill">{{ snapshot.snapshot_date if snapshot else '等待数据' }}</span></div>
+    {% if snapshot and snapshot.total_value_cents is not none %}
+      <p class="metric-value">¥ {{ snapshot.total_value_cents|money }}</p>
+      <p class="hint">完整总资产 · 数据时间 {{ snapshot_details.get('as_of', '未知') }}。</p>
+    {% else %}
+      <p class="metric-value">总资产未知</p>
+      <p class="hint">等待数据：当前仅展示已确认记录，不推测行情或补齐缺失估值。</p>
+      {% if snapshot %}<p>已知部分：¥ {{ snapshot.known_value_cents|money }}</p>{% endif %}
+    {% endif %}
+  </section>
+  <section class="panel">
+    <div class="section-heading"><h2>现金桶</h2><span class="pill">账本记录 · 待核对时效</span></div>
+    {% if cash_buckets %}<ul class="record-list">
+      {% for bucket in cash_buckets %}<li><strong>{{ bucket.bucket_kind }}</strong><span>账本记录 ¥ {{ bucket.balance_cents|money }} · 更新于 {{ bucket.updated_at|shanghai_datetime }} · 请确认是否陈旧</span></li>{% endfor %}
+    </ul>{% else %}<p class="hint">尚无已确认现金桶。</p>{% endif %}
+  </section>
+</div>
+<section class="panel"><div class="section-heading"><h2>行动边界</h2><span class="pill">条件式建议</span></div>
+  <p>数据完整且新鲜后，系统才会依据储备金、投资预算和核心/卫星上限生成建议。任何金额、比例、触发条件、最大风险与止损纪律都必须人工复核。</p>
+</section>
+{% endblock %}

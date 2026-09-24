@@ -14,8 +14,8 @@
   {% for key,label,url,icon in [
     ('dashboard','资产总览','/','◈'),('holdings','我的持仓','/holdings','▤'),
     ('transactions','收支流水','/transactions','⇄'),('accounts','账户与基金','/accounts','▦'),
-    ('prices','手工净值','/prices/new','◇'),('analysis','投资分析',none,'↗'),
-    ('alerts','提醒中心','/alerts','○'),('imports','数据导入',none,'↓'),('settings','偏好设置',none,'⚙')
+    ('prices','手工净值','/prices/new','◇'),('analysis','投资分析','/analysis','↗'),
+    ('alerts','提醒中心','/alerts','○'),('imports','数据导入',none,'↓'),('settings','偏好设置','/settings','⚙')
   ] %}
     {% if url and not demo %}<a class="nav-item {{ 'active' if section == key }}" href="{{ url }}" {% if section == key %}aria-current="page"{% endif %}><span aria-hidden="true">{{ icon }}</span>{{ label }}</a>
     {% elif demo and key == 'dashboard' %}<a class="nav-item active" href="/preview" aria-current="page"><span>◈</span>资产总览</a>
