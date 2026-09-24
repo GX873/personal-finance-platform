@@ -44,4 +44,5 @@ def test_release_check_scans_secrets_without_printing_values() -> None:
     assert "FINANCE_SERVERCHAN_SENDKEY" in script
     assert "FINANCE_WECOM_WEBHOOK_URL" in script
     assert "git grep" in script or "rg" in script
+    assert 'COVERAGE_FILE="$TMP_DIR/.coverage"' in script
     assert "trap" in script

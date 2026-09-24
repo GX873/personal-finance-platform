@@ -15,6 +15,7 @@ trap cleanup EXIT INT TERM
 
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export FINANCE_DATABASE_URL="sqlite:///$TMP_DIR/pytest.sqlite3"
+export COVERAGE_FILE="$TMP_DIR/.coverage"
 
 step() {
     printf '\n==> %s\n' "$*"
