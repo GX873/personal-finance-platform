@@ -1,7 +1,7 @@
 import re
 from functools import lru_cache
 from typing import Literal
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,7 +25,7 @@ def validate_opaque_secret_value(value: str) -> None:
         raise ValueError("notification credential is invalid")
 
 
-def validate_wecom_webhook_url_value(value: str) -> None:
+def validate_wecom_webhook_url_value(value: str) -> str:
     parsed = urlsplit(value)
     query = parse_qs(parsed.query, keep_blank_values=True)
     if (
@@ -46,6 +46,15 @@ def validate_wecom_webhook_url_value(value: str) -> None:
         raise ValueError(
             "wecom_webhook_url must be an official HTTPS webhook"
         ) from None
+    return urlunsplit(
+        (
+            "https",
+            "qyapi.weixin.qq.com",
+            "/cgi-bin/webhook/send",
+            urlencode({"key": query["key"][0]}),
+            "",
+        )
+    )
 
 
 class Settings(BaseSettings):
@@ -122,8 +131,7 @@ class Settings(BaseSettings):
         if value is None:
             return None
         raw = value.get_secret_value()
-        validate_wecom_webhook_url_value(raw)
-        return value
+        return SecretStr(validate_wecom_webhook_url_value(raw))
 
     @model_validator(mode="after")
     def validate_production_secret(self) -> "Settings":

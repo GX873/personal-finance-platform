@@ -6,10 +6,14 @@ from typing import ClassVar, Self
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from finance_app.config import Settings
+from finance_app.db import Base, create_db_engine
 from finance_app.notifications.base import DeliveryStatus, Notification
 from finance_app.notifications.email import EmailNotifier
+from finance_app.notifications.models import NotificationChannel
+from finance_app.notifications.service import NotificationDeliveryService
 
 
 class FakeSMTP:
@@ -224,4 +228,115 @@ def test_smtp_response_codes_have_enforced_retry_classification(
 
     assert result.error_code == error_code
     assert result.retryable is retryable
+    assert "smtp-secret-code" not in (result.error_summary or "")
+
+
+@pytest.mark.parametrize(
+    ("refusals", "error_code", "retryable"),
+    [
+        (
+            {"temporary@example.com": (450, b"temporary secret detail")},
+            "temporary_failure",
+            True,
+        ),
+        (
+            {"permanent@example.com": (550, b"permanent secret detail")},
+            "recipient_rejected",
+            False,
+        ),
+        (
+            {
+                "temporary@example.com": (451, b"temporary secret detail"),
+                "permanent@example.com": (550, b"permanent secret detail"),
+            },
+            "temporary_failure",
+            True,
+        ),
+        (
+            {
+                "accepted@example.com": (250, b"accepted secret detail"),
+                "temporary@example.com": (451, b"temporary secret detail"),
+            },
+            "recipient_rejected",
+            False,
+        ),
+    ],
+)
+def test_recipient_refusals_use_safe_aggregate_smtp_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    smtp_settings: Settings,
+    refusals: dict[str, tuple[int, bytes]],
+    error_code: str,
+    retryable: bool,
+) -> None:
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.login_error = smtplib.SMTPRecipientsRefused(refusals)
+
+    result = EmailNotifier(smtp_settings).send(Notification("Digest", "Body"))
+
+    assert result.error_code == error_code
+    assert result.retryable is retryable
+    rendered = result.error_summary or ""
+    assert "example.com" not in rendered
+    assert "secret detail" not in rendered
+    assert "smtp-secret-code" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code", "retryable"),
+    [
+        (451, "temporary_failure", True),
+        (550, "recipient_rejected", False),
+    ],
+)
+def test_sender_refusal_uses_smtp_status_without_exposing_details(
+    monkeypatch: pytest.MonkeyPatch,
+    smtp_settings: Settings,
+    status: int,
+    error_code: str,
+    retryable: bool,
+) -> None:
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.login_error = smtplib.SMTPSenderRefused(
+        status, b"sender secret detail", "sender-secret@example.com"
+    )
+
+    result = EmailNotifier(smtp_settings).send(Notification("Digest", "Body"))
+
+    assert result.error_code == error_code
+    assert result.retryable is retryable
+    rendered = result.error_summary or ""
+    assert "sender-secret" not in rendered
+    assert "secret detail" not in rendered
+    assert "smtp-secret-code" not in rendered
+
+
+def test_temporary_recipient_refusal_retries_three_times_with_bounded_delays(
+    monkeypatch: pytest.MonkeyPatch, smtp_settings: Settings
+) -> None:
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.login_error = smtplib.SMTPRecipientsRefused(
+        {"private@example.com": (450, b"smtp-secret-code provider detail")}
+    )
+    engine = create_db_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    sleeps: list[float] = []
+
+    with Session(engine) as session:
+        channel = NotificationChannel(name="Primary email", channel_type="email")
+        session.add(channel)
+        session.flush()
+        result = NotificationDeliveryService(
+            session, sleep=sleeps.append
+        ).deliver(
+            channel,
+            EmailNotifier(smtp_settings),
+            Notification("Digest", "Body"),
+        )
+
+    assert result.status is DeliveryStatus.FAILED
+    assert result.attempt_count == 3
+    assert result.retryable is True
+    assert len(FakeSMTP.instances) == 3
+    assert sleeps == [1.0, 3.0]
     assert "smtp-secret-code" not in (result.error_summary or "")

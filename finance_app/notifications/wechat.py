@@ -67,7 +67,7 @@ class WeChatNotifier:
             elif provider == "serverchan":
                 validate_serverchan_sendkey_value(raw)
             elif provider == "wecom":
-                validate_wecom_webhook_url_value(raw)
+                credential = SecretStr(validate_wecom_webhook_url_value(raw))
         self.provider = provider
         self._credential = credential
         self._client = client if client is not None else httpx.Client()

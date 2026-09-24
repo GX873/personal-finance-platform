@@ -189,6 +189,58 @@ def test_standard_httpx_request_logs_redact_url_credentials(
     assert secret not in caplog.text
 
 
+@pytest.mark.parametrize("encoded_key", ["%6Bey", "%6bey"])
+def test_percent_encoded_wecom_query_name_is_canonicalized_before_request_and_log(
+    monkeypatch: pytest.MonkeyPatch,
+    encoded_key: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    token = "encoded-query-secret"
+    monkeypatch.setenv(
+        "FINANCE_WECOM_WEBHOOK_URL",
+        f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?{encoded_key}={token}",
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"errcode": 0})
+
+    caplog.set_level(logging.INFO, logger="httpx")
+    result = build_wechat_notifier(
+        "wecom", Settings(), client=make_client(handler)
+    ).send(Notification("Digest", "Body"))
+
+    assert result.status is DeliveryStatus.SUCCESS
+    assert str(requests[0].url) == (
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send"
+        "?key=encoded-query-secret"
+    )
+    assert token not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "key=first-secret&key=second-secret",
+        "%6Bey=first-secret&%6bey=second-secret",
+        "%6Bey=credential-secret&extra=value",
+    ],
+)
+def test_wecom_rejects_duplicate_or_extra_encoded_query_parameters(
+    monkeypatch: pytest.MonkeyPatch, query: str
+) -> None:
+    monkeypatch.setenv(
+        "FINANCE_WECOM_WEBHOOK_URL",
+        f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?{query}",
+    )
+
+    with pytest.raises(ValidationError) as caught:
+        Settings()
+
+    assert "secret" not in str(caught.value)
+
+
 def test_timeout_is_retryable_and_exception_text_is_redacted(
     wechat_env: None,
 ) -> None:

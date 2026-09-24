@@ -62,12 +62,22 @@ class EmailNotifier:
                 error_summary="authentication_failed: SMTP rejected credentials",
                 retryable=False,
             )
-        except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused):
-            return DeliveryResult.failed(
-                provider=self.provider,
-                error_code="recipient_rejected",
-                error_summary="recipient_rejected: SMTP rejected the envelope",
-                retryable=False,
+        except smtplib.SMTPRecipientsRefused as error:
+            statuses = [
+                details[0]
+                for details in error.recipients.values()
+                if isinstance(details, tuple) and details
+            ]
+            has_success = any(
+                type(status) is int and 200 <= status < 300 for status in statuses
+            )
+            retryable = not has_success and any(
+                self._is_temporary_status(status) for status in statuses
+            )
+            return self._envelope_refusal(retryable)
+        except smtplib.SMTPSenderRefused as error:
+            return self._envelope_refusal(
+                self._is_temporary_status(error.smtp_code)
             )
         except smtplib.SMTPResponseException as error:
             retryable = 400 <= error.smtp_code < 500
@@ -118,3 +128,19 @@ class EmailNotifier:
                 self._recipient,
             )
         )
+
+    def _envelope_refusal(self, retryable: bool) -> DeliveryResult:
+        return DeliveryResult.failed(
+            provider=self.provider,
+            error_code="temporary_failure" if retryable else "recipient_rejected",
+            error_summary=(
+                "temporary_failure: SMTP envelope is temporarily unavailable"
+                if retryable
+                else "recipient_rejected: SMTP rejected the envelope"
+            ),
+            retryable=retryable,
+        )
+
+    @staticmethod
+    def _is_temporary_status(status: object) -> bool:
+        return type(status) is int and 400 <= status < 500
