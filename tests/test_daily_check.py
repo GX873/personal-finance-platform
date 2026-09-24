@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select, update
 
 from finance_app.cli import DailyCheck, DailyCheckResult, main
@@ -129,6 +131,75 @@ class StubNotifier:
     def send(self, notification):
         self.calls += 1
         return self.result
+
+
+def test_refresh_prices_closes_owned_provider_after_success(db_session, monkeypatch):
+    db_session.add(
+        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    )
+    db_session.flush()
+
+    class Provider:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    provider = Provider()
+
+    class Service:
+        def __init__(self, session, actual_provider, *, clock):
+            assert session is db_session
+            assert actual_provider is provider
+
+        def refresh(self, code):
+            return code
+
+    monkeypatch.setattr(
+        "finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: provider
+    )
+    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
+
+    result = DailyCheck(db_session, clock=lambda: NOW).refresh_prices(
+        date(2026, 9, 23)
+    )
+
+    assert result == ["000001"]
+    assert provider.closed is True
+
+
+def test_refresh_prices_closes_owned_provider_after_unexpected_error(
+    db_session, monkeypatch
+):
+    db_session.add(
+        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    )
+    db_session.flush()
+
+    class Provider:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    provider = Provider()
+
+    class Service:
+        def __init__(self, session, actual_provider, *, clock):
+            pass
+
+        def refresh(self, code):
+            raise RuntimeError("unexpected refresh failure")
+
+    monkeypatch.setattr(
+        "finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: provider
+    )
+    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
+
+    with pytest.raises(RuntimeError, match="unexpected refresh failure"):
+        DailyCheck(db_session, clock=lambda: NOW).refresh_prices(date(2026, 9, 23))
+
+    assert provider.closed is True
 
 
 def test_daily_check_orders_freshness_before_advice(db_session):
@@ -329,6 +400,81 @@ def test_allocation_targets_trigger_satellite_reduction(db_session):
     )
 
     assert any(item.reason_code == "ABOVE_UPPER" for item in advice)
+
+
+def test_two_satellite_reductions_keep_identity_and_warn_against_adding(db_session):
+    assets = [
+        Asset(
+            code="SAT-A",
+            market="CN",
+            name="Satellite A",
+            portfolio_role=PortfolioRole.SATELLITE,
+        ),
+        Asset(
+            code="SAT-B",
+            market="CN",
+            name="Satellite B",
+            portfolio_role=PortfolioRole.SATELLITE,
+        ),
+    ]
+    db_session.add_all(
+        assets
+        + [
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=NOW),
+            AllocationTarget(name="satellite", target_bps=3000),
+            AllocationTarget(name="satellite_each", target_bps=0, upper_bps=1000),
+        ]
+    )
+    db_session.flush()
+    snapshot = PortfolioSnapshot(
+        snapshot_date=date(2026, 9, 23),
+        total_value_cents=120_000,
+        known_value_cents=120_000,
+        invested_value_cents=100_000,
+        cash_value_cents=20_000,
+        data_complete=True,
+        details_json=json.dumps(
+            {
+                "holdings": [
+                    {"asset_id": assets[0].id, "value_cents": 30_000},
+                    {"asset_id": assets[1].id, "value_cents": 20_000},
+                ]
+            }
+        ),
+    )
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:statement"],
+    }
+    check = DailyCheck(db_session, clock=lambda: NOW)
+
+    advice = check.evaluate_rules(snapshot, freshness)
+    reductions = [
+        item for item in advice if item.action is AdviceAction.REDUCE_IN_BATCHES
+    ]
+
+    assert [
+        (
+            item.scope,
+            item.code,
+            item.name,
+            item.current_bps,
+            item.upper_bps,
+        )
+        for item in reductions
+    ] == [
+        ("portfolio_role", None, "satellite", 5000, 3000),
+        ("asset", "SAT-A", "Satellite A", 3000, 1000),
+        ("asset", "SAT-B", "Satellite B", 2000, 1000),
+    ]
+    body = check.build_digest(date(2026, 9, 23), snapshot, freshness, advice).body
+    assert "对象：Satellite A（SAT-A）" in body
+    assert "当前占比：30.00%；上限：10.00%" in body
+    assert "整体与单基金减持金额不可累加" in body
 
 
 def test_incomplete_snapshot_forces_wait_even_if_threshold_flags_are_true(db_session):

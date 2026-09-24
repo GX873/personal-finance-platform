@@ -48,6 +48,7 @@ from finance_app.portfolio.models import (
 from finance_app.portfolio.rules import (
     SHANGHAI,
     Advice,
+    AdviceAction,
     RuleContext,
     evaluate_allocation,
     evaluate_new_investment,
@@ -270,15 +271,18 @@ class DailyCheck:
         del business_date
         results: list[Any] = []
         provider = EastMoneyFundNavProvider(clock=self.clock)
-        service = FundPriceService(self.session, provider, clock=self.clock)
-        fund_codes = self.session.scalars(
-            select(Asset.code)
-            .where(Asset.market == "CN", Asset.asset_class == "fund")
-            .order_by(Asset.code)
-        )
-        for code in fund_codes:
-            results.append(service.refresh(code))
-        return results
+        try:
+            service = FundPriceService(self.session, provider, clock=self.clock)
+            fund_codes = self.session.scalars(
+                select(Asset.code)
+                .where(Asset.market == "CN", Asset.asset_class == "fund")
+                .order_by(Asset.code)
+            )
+            for code in fund_codes:
+                results.append(service.refresh(code))
+            return results
+        finally:
+            provider.close()
 
     def validate_freshness(self, business_date: date) -> dict[str, Any]:
         now = self._reference_time(business_date)
@@ -473,7 +477,7 @@ class DailyCheck:
         }
         context = self._rule_context(effective_freshness, business_date)
         role_values = {PortfolioRole.CORE.value: 0, PortfolioRole.SATELLITE.value: 0}
-        satellite_positions: dict[int, int] = {}
+        satellite_positions: dict[int, tuple[Asset, int]] = {}
         for item in holdings:
             if not isinstance(item, dict) or type(item.get("value_cents")) is not int:
                 continue
@@ -486,8 +490,10 @@ class DailyCheck:
                 continue
             role_values[asset.portfolio_role] += value
             if asset.portfolio_role == PortfolioRole.SATELLITE:
+                previous = satellite_positions.get(asset.id)
                 satellite_positions[asset.id] = (
-                    satellite_positions.get(asset.id, 0) + value
+                    asset,
+                    (previous[1] if previous is not None else 0) + value,
                 )
         for role, value in role_values.items():
             target = targets.get(role)
@@ -501,12 +507,15 @@ class DailyCheck:
                     value,
                     target.target_bps,
                     target.target_bps,
+                    invested_value_cents=snapshot.invested_value_cents,
                     now=self.clock(),
+                    name=role,
+                    scope="portfolio_role",
                 )
             )
         each_target = targets.get("satellite_each")
         if each_target is not None and each_target.upper_bps is not None:
-            for value in satellite_positions.values():
+            for asset, value in satellite_positions.values():
                 current_bps = value * 10000 // snapshot.invested_value_cents
                 advice.append(
                     evaluate_allocation(
@@ -515,7 +524,12 @@ class DailyCheck:
                         value,
                         each_target.target_bps,
                         each_target.upper_bps,
+                        invested_value_cents=snapshot.invested_value_cents,
                         now=self.clock(),
+                        asset_id=asset.id,
+                        code=asset.code,
+                        name=asset.name,
+                        scope="asset",
                     )
                 )
         return advice
@@ -585,15 +599,38 @@ class DailyCheck:
             f"数据时间：{domain_times}",
             f"数据来源：{source_text}",
         ]
+        if any(
+            item.action is AdviceAction.REDUCE_IN_BATCHES
+            and item.scope == "portfolio_role"
+            and item.name == PortfolioRole.SATELLITE.value
+            for item in advice
+        ) and any(
+            item.action is AdviceAction.REDUCE_IN_BATCHES and item.scope == "asset"
+            for item in advice
+        ):
+            lines.append("注意：整体与单基金减持金额不可累加；单基金优先采用具体建议。")
         for item in advice:
             amount = (
                 "未知" if item.amount_cents is None else self._yuan(item.amount_cents)
             )
+            lines.extend((f"行动：{item.action.value}", f"金额：{amount}"))
+            if item.scope is not None:
+                identity = item.name or item.code or "未命名"
+                if item.code is not None:
+                    identity = f"{identity}（{item.code}）"
+                elif item.scope == "portfolio_role":
+                    identity = f"{identity}（整体）"
+                lines.append(f"对象：{identity}")
+            if item.current_bps is not None and item.upper_bps is not None:
+                lines.append(
+                    "当前占比："
+                    f"{Decimal(item.current_bps) / 100:.2f}%；"
+                    f"上限：{Decimal(item.upper_bps) / 100:.2f}%"
+                )
+            else:
+                lines.append(f"比例：{ratio_text}")
             lines.extend(
                 (
-                    f"行动：{item.action.value}",
-                    f"金额：{amount}",
-                    f"比例：{ratio_text}",
                     f"触发条件：{item.trigger}",
                     f"最大风险：{item.max_risk}",
                     f"止损纪律：{item.stop_discipline}",

@@ -66,6 +66,12 @@ class Advice:
     source: str
     timestamp: datetime
     conditional: bool = True
+    asset_id: int | None = None
+    code: str | None = None
+    name: str | None = None
+    current_bps: int | None = None
+    upper_bps: int | None = None
+    scope: str | None = None
 
 
 def _advice(
@@ -74,6 +80,13 @@ def _advice(
     amount: int | None,
     reason: str,
     trigger: str,
+    *,
+    asset_id: int | None = None,
+    code: str | None = None,
+    name: str | None = None,
+    current_bps: int | None = None,
+    upper_bps: int | None = None,
+    scope: str | None = None,
 ) -> Advice:
     return Advice(
         action,
@@ -84,6 +97,12 @@ def _advice(
         "执行前人工复核；止损阈值不是成交价或亏损上限保证。",
         context.source,
         context.timestamp,
+        asset_id=asset_id,
+        code=code,
+        name=name,
+        current_bps=current_bps,
+        upper_bps=upper_bps,
+        scope=scope,
     )
 
 
@@ -162,8 +181,13 @@ def evaluate_allocation(
     target_bps: int | None,
     upper_bps: int | None,
     *,
+    invested_value_cents: int,
     batch_bps: int = 1000,
     now: datetime | None = None,
+    asset_id: int | None = None,
+    code: str | None = None,
+    name: str | None = None,
+    scope: str | None = None,
 ) -> Advice:
     for value in (current_bps, target_bps, upper_bps, batch_bps):
         if value is not None and (type(value) is not int or not 0 <= value <= 10000):
@@ -173,6 +197,12 @@ def evaluate_allocation(
         or not 0 <= position_value_cents <= 2**63 - 1
     ):
         raise ValueError("invalid position value")
+    if (
+        type(invested_value_cents) is not int
+        or not 0 < invested_value_cents <= 2**63 - 1
+        or position_value_cents > invested_value_cents
+    ):
+        raise ValueError("invalid invested value")
     if target_bps is not None and upper_bps is not None and target_bps > upper_bps:
         raise ValueError("target cannot exceed upper allocation")
     reference = now if now is not None else utc_now()
@@ -186,6 +216,12 @@ def evaluate_allocation(
             None,
             "DATA_UNCONFIRMED",
             "请先确认估值和持仓。",
+            asset_id=asset_id,
+            code=code,
+            name=name,
+            current_bps=current_bps,
+            upper_bps=upper_bps,
+            scope=scope,
         )
     if target_bps is None or upper_bps is None:
         return _advice(
@@ -194,20 +230,50 @@ def evaluate_allocation(
             0,
             "ALLOCATION_UNCONFIGURED",
             "未配置目标和上限，暂不建议调整。",
+            asset_id=asset_id,
+            code=code,
+            name=name,
+            current_bps=current_bps,
+            upper_bps=upper_bps,
+            scope=scope,
         )
-    if current_bps > upper_bps:
-        # Sale proceeds stay as cash: total portfolio value is unchanged.
-        excess = position_value_cents * (current_bps - upper_bps) // current_bps
-        amount = min(position_value_cents * batch_bps // 10000, excess)
+    if position_value_cents * 10000 > upper_bps * invested_value_cents:
+        # Sale proceeds leave invested value, so both numerator and denominator shrink.
+        numerator = (
+            position_value_cents * 10000 - upper_bps * invested_value_cents
+        )
+        denominator = 10000 - upper_bps
+        required = (numerator + denominator - 1) // denominator
+        amount = min(
+            position_value_cents,
+            position_value_cents * batch_bps // 10000,
+            required,
+        )
         return _advice(
             context,
             AdviceAction.REDUCE_IN_BATCHES,
             amount,
             "ABOVE_UPPER",
             f"占比超过上限，可人工确认后分批减持；单批上限为持仓的{batch_bps}/10000。",
+            asset_id=asset_id,
+            code=code,
+            name=name,
+            current_bps=current_bps,
+            upper_bps=upper_bps,
+            scope=scope,
         )
     return _advice(
-        context, AdviceAction.HOLD, 0, "WITHIN_UPPER", "未超过配置上限，继续观察。"
+        context,
+        AdviceAction.HOLD,
+        0,
+        "WITHIN_UPPER",
+        "未超过配置上限，继续观察。",
+        asset_id=asset_id,
+        code=code,
+        name=name,
+        current_bps=current_bps,
+        upper_bps=upper_bps,
+        scope=scope,
     )
 
 

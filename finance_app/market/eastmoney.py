@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from typing import Self
 
 import httpx
 
@@ -33,9 +34,20 @@ class EastMoneyFundNavProvider:
         client: httpx.Client | None = None,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
+        self._owns_client = client is None
         self._client = client if client is not None else httpx.Client()
         self._clock = clock
         self._timeout = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=3.0)
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
     def fetch(self, fund_code: str) -> FundNavQuote:
         if not isinstance(fund_code, str) or _FUND_CODE.fullmatch(fund_code) is None:

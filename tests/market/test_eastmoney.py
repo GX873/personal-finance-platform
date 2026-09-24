@@ -18,6 +18,19 @@ def provider(handler) -> EastMoneyFundNavProvider:
     return EastMoneyFundNavProvider(client=client, clock=lambda: NOW)
 
 
+def test_provider_context_closes_owned_client_but_not_injected_client():
+    with EastMoneyFundNavProvider(clock=lambda: NOW) as owned:
+        owned_client = owned._client
+        assert owned_client.is_closed is False
+    assert owned_client.is_closed is True
+
+    shared_client = httpx.Client(transport=httpx.MockTransport(lambda request: None))
+    with EastMoneyFundNavProvider(client=shared_client, clock=lambda: NOW):
+        pass
+    assert shared_client.is_closed is False
+    shared_client.close()
+
+
 class CountingStream(httpx.SyncByteStream):
     def __init__(self, chunks: list[bytes]) -> None:
         self._chunks = chunks

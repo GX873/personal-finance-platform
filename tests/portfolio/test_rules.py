@@ -65,21 +65,99 @@ def test_reserve_cash_budget_and_conditional_purchase():
 
 def test_allocation_limits_and_unconfigured():
     assert (
-        evaluate_allocation(context(), 2500, 100000, 1000, 1500).amount_cents == 10000
+        evaluate_allocation(
+            context(),
+            2500,
+            100000,
+            1000,
+            1500,
+            invested_value_cents=400000,
+        ).amount_cents
+        == 10000
     )
-    assert evaluate_allocation(context(), 1501, 100000, 1000, 1500).amount_cents == 66
     assert (
-        evaluate_allocation(context(), 100, 100000, None, None).action
+        evaluate_allocation(
+            context(),
+            1501,
+            100000,
+            1000,
+            1500,
+            invested_value_cents=666222,
+        ).amount_cents
+        == 79
+    )
+    assert (
+        evaluate_allocation(
+            context(), 100, 100000, None, None, invested_value_cents=1000000
+        ).action
         == AdviceAction.HOLD
     )
     with pytest.raises(ValueError):
-        evaluate_allocation(context(), 2500, 100000, 2000, 1500)
+        evaluate_allocation(
+            context(), 2500, 100000, 2000, 1500, invested_value_cents=400000
+        )
+
+
+def test_allocation_reduction_uses_shrinking_invested_denominator():
+    advice = evaluate_allocation(
+        context(),
+        2000,
+        20_000,
+        1500,
+        1500,
+        invested_value_cents=100_000,
+    )
+
+    # ceil((20_000 - 15% * 100_000) / (1 - 15%)) = 5_883
+    assert advice.action is AdviceAction.REDUCE_IN_BATCHES
+    assert advice.amount_cents == 2_000  # 10% batch cap
+    assert (
+        evaluate_allocation(
+            context(),
+            2000,
+            20_000,
+            1500,
+            1500,
+            invested_value_cents=100_000,
+            batch_bps=10_000,
+        ).amount_cents
+        == 5_883
+    )
+
+
+def test_allocation_exact_threshold_and_one_cent_rounding():
+    at_limit = evaluate_allocation(
+        context(),
+        1500,
+        15_000,
+        1500,
+        1500,
+        invested_value_cents=100_000,
+    )
+    just_over = evaluate_allocation(
+        context(),
+        1500,
+        15_001,
+        1500,
+        1500,
+        invested_value_cents=100_000,
+    )
+
+    assert at_limit.action is AdviceAction.HOLD
+    assert just_over.action is AdviceAction.REDUCE_IN_BATCHES
+    assert just_over.amount_cents == 2
 
 
 def test_configurable_batch_and_future_context():
     assert (
         evaluate_allocation(
-            context(), 2500, 100000, 1000, 1500, batch_bps=500
+            context(),
+            2500,
+            100000,
+            1000,
+            1500,
+            invested_value_cents=400000,
+            batch_bps=500,
         ).amount_cents
         == 5000
     )
