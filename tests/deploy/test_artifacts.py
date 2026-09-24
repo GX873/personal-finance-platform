@@ -104,3 +104,33 @@ def test_installer_does_not_overwrite_secrets_or_run_trades() -> None:
     assert "chmod 600" not in script
     assert "buy" not in script
     assert "sell" not in script
+
+
+def test_installer_publishes_a_clean_root_owned_git_release() -> None:
+    script = read("install.sh")
+    assert "RELEASE_SHA" in script
+    assert "command -v git" in script
+    assert "git archive" in script
+    assert "--exclude=.env" in script
+    assert "--exclude=data" in script
+    assert "--exclude=.venv" in script
+    assert 'cp -a "$SOURCE_DIR/.' not in script
+    assert 'chown -R financeapp:financeapp "$STATE_ROOT" "$RELEASE_DIR"' not in script
+    assert 'chown -R root:root "$RELEASE_DIR"' in script
+    assert "FINANCE_SESSION_HTTPS_ONLY=false" in script
+    assert "without TLS" in script
+
+
+def test_installer_relocks_existing_account_and_repairs_private_permissions() -> None:
+    script = read("install.sh")
+    assert "usermod --shell /usr/sbin/nologin" in script
+    assert "--home-dir \"$STATE_ROOT\"" in script
+    assert "--lock financeapp" in script
+    assert 'chmod 0600 "$ENV_FILE"' in script
+    for directory in ("data", "backups", "uploads"):
+        assert f'chmod 0750 "$STATE_ROOT/{directory}"' in script
+
+
+def test_csp_allows_only_the_templates_controlled_inline_widths() -> None:
+    config = read("nginx-finance.conf")
+    assert "style-src 'self' 'unsafe-inline'" in config
