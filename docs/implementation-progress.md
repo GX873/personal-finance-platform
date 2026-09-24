@@ -11,7 +11,7 @@ Updated: 2026-09-23
 - [x] Task 7: Responsive dashboard and local preview; reviewed at 1e3dbf1 (102 tests).
 - [x] Task 8: Manual entry, reversals, price entry and audited form actions; reviewed at 4d0f8f8 (152 tests).
 - [x] Task 9: Confirmed CSV/XLSX imports and OCR candidates; reviewed at 62c5b27 (231 tests).
-- [ ] Task 10: Fund NAV integration.
+- [x] Task 10: Traceable EastMoney fund NAV integration; reviewed at 4373e92 (269 tests).
 - [ ] Task 11: Email and WeChat notifications.
 - [ ] Task 12: Daily checks and settings.
 - [ ] Task 13: Exports, backups and restore verification.
