@@ -5,7 +5,9 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,64 @@ class BackupVerification:
     checksum: str
     integrity_check: str
     schema_valid: bool
+    schema_revision: str | None
+
+
+@dataclass(frozen=True)
+class BackupStatus:
+    path: Path
+    modified_at: datetime
+    size_bytes: int
+    integrity_check: str
+    schema_valid: bool
+
+
+def backup_directory(source: Any | None = None) -> Path:
+    return _database_path(source).parent / "backups"
+
+
+def recent_backup_statuses(
+    directory: str | Path, *, limit: int = 14
+) -> list[BackupStatus]:
+    root = Path(directory).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    statuses: list[BackupStatus] = []
+    paths = sorted(
+        root.glob("finance-*.sqlite3"),
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )[:limit]
+    for path in paths:
+        stat = path.stat()
+        try:
+            result = verify_backup(path, require_checksum=True)
+            integrity = result.integrity_check
+            schema_valid = result.schema_valid
+        except (OSError, ValueError):
+            integrity = "invalid"
+            schema_valid = False
+        statuses.append(
+            BackupStatus(
+                path=path,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
+                size_bytes=stat.st_size,
+                integrity_check=integrity,
+                schema_valid=schema_valid,
+            )
+        )
+    return statuses
+
+
+_REQUIRED_SCHEMA = {
+    "accounts": {"id", "name", "kind", "opening_balance_cents"},
+    "assets": {"id", "code", "market", "name"},
+    "holdings": {"id", "account_id", "asset_id", "quantity", "cost_cents"},
+    "transactions": {"id", "source", "external_id", "kind", "account_id"},
+    "audit_events": {"id", "event_type", "created_at"},
+    "alembic_version": {"version_num"},
+}
+_SCHEMA_REVISION = "0002"
 
 
 def _database_path(source: Any | None) -> Path:
@@ -74,8 +134,8 @@ def _read_expected_checksum(path: Path) -> str | None:
 
 def verify_backup(path: str | Path, *, require_checksum: bool = False) -> BackupVerification:
     candidate = Path(path).expanduser().resolve()
-    if not candidate.is_file() or candidate.suffix != ".sqlite3":
-        raise ValueError("backup path must be an existing .sqlite3 file")
+    if not candidate.is_file():
+        raise ValueError("backup path must be an existing SQLite file")
     checksum = _sha256(candidate)
     expected = _read_expected_checksum(candidate)
     if expected is not None and checksum != expected:
@@ -85,19 +145,28 @@ def verify_backup(path: str | Path, *, require_checksum: bool = False) -> Backup
     db = None
     try:
         db = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
-        integrity = str(db.execute("PRAGMA integrity_check").fetchone()[0]).lower()
-        tables = {
-            row[0]
-            for row in db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            )
+        integrity_rows = [str(row[0]).lower() for row in db.execute("PRAGMA integrity_check")]
+        integrity = "ok" if integrity_rows == ["ok"] else "; ".join(integrity_rows)
+        table_columns = {
+            table: {row[1] for row in db.execute(f'PRAGMA table_info("{table}")')}
+            for table in _REQUIRED_SCHEMA
         }
+        revision_row = (
+            db.execute("SELECT version_num FROM alembic_version").fetchone()
+            if table_columns["alembic_version"]
+            else None
+        )
+        revision = str(revision_row[0]) if revision_row else None
+        schema_valid = revision == _SCHEMA_REVISION and all(
+            required <= table_columns[table]
+            for table, required in _REQUIRED_SCHEMA.items()
+        )
     except sqlite3.DatabaseError as exc:
         raise ValueError("backup is not a readable SQLite database") from exc
     finally:
         if db is not None:
             db.close()
-    return BackupVerification(candidate, checksum, integrity, bool(tables))
+    return BackupVerification(candidate, checksum, integrity, schema_valid, revision)
 
 
 def _record_audit(session: Session | None, event_type: str, details: dict[str, Any]) -> None:
@@ -110,22 +179,55 @@ def _record_audit(session: Session | None, event_type: str, details: dict[str, A
             details_json=json.dumps(details, ensure_ascii=False, sort_keys=True),
         )
     )
-    session.commit()
+    session.flush()
+
+
+def _verified_backups(directory: Path) -> list[Path]:
+    verified: list[Path] = []
+    for path in directory.glob("finance-*.sqlite3"):
+        try:
+            result = verify_backup(path, require_checksum=True)
+        except (OSError, ValueError):
+            continue
+        if result.integrity_check == "ok" and result.schema_valid:
+            verified.append(path)
+    return sorted(
+        verified,
+        key=lambda item: (item.stat().st_mtime_ns, item.name),
+        reverse=True,
+    )
 
 
 def _retain_verified(directory: Path, keep: int) -> None:
     if keep < 1:
         raise ValueError("keep must be at least 1")
-    verified: list[Path] = []
-    for path in directory.glob("finance-*.sqlite3"):
-        try:
-            verify_backup(path, require_checksum=True)
-        except (OSError, ValueError):
-            continue
-        verified.append(path)
-    for path in sorted(verified, key=lambda item: item.name, reverse=True)[keep:]:
+    for path in _verified_backups(directory)[keep:]:
         path.unlink(missing_ok=True)
         _sidecar(path).unlink(missing_ok=True)
+
+
+def _stage_retention(directory: Path, keep: int, current: Path) -> tuple[Path, list[tuple[Path, Path]]]:
+    candidates = _verified_backups(directory)[keep:]
+    if not candidates:
+        return directory / f".retention-{uuid.uuid4().hex}", []
+    quarantine = directory / f".retention-{uuid.uuid4().hex}"
+    quarantine.mkdir()
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for path in candidates:
+            if path == current:
+                continue
+            for original in (path, _sidecar(path)):
+                if original.exists():
+                    staged = quarantine / original.name
+                    original.replace(staged)
+                    moved.append((original, staged))
+    except Exception:
+        for original, staged in reversed(moved):
+            staged.replace(original)
+        quarantine.rmdir()
+        raise
+    return quarantine, moved
 
 
 def create_backup(
@@ -137,6 +239,8 @@ def create_backup(
     clock=utc_now,
 ) -> Path:
     """Create and verify an online SQLite backup, retaining the newest copies."""
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
     if isinstance(source, Session) and session is None:
         session = source
     live_path = _database_path(source)
@@ -151,6 +255,10 @@ def create_backup(
         target = target_dir / f"finance-{stamp}-{suffix}.sqlite3"
         suffix += 1
     temporary = target.with_suffix(".sqlite3.tmp")
+    temporary_sidecar = target_dir / f".{target.name}.{uuid.uuid4().hex}.sha256.tmp"
+    published = False
+    quarantine: Path | None = None
+    moved: list[tuple[Path, Path]] = []
     try:
         source_db = sqlite3.connect(live_path)
         target_db = sqlite3.connect(temporary)
@@ -161,21 +269,40 @@ def create_backup(
         finally:
             target_db.close()
             source_db.close()
-        temporary.replace(target)
-        verification = verify_backup(target)
+        verification = verify_backup(temporary)
         if verification.integrity_check != "ok" or not verification.schema_valid:
             raise ValueError("new backup failed integrity or schema validation")
         checksum = verification.checksum
-        _sidecar(target).write_text(f"{checksum}  {target.name}\n", encoding="ascii")
-        _retain_verified(target_dir, keep)
+        temporary_sidecar.write_text(f"{checksum}  {target.name}\n", encoding="ascii")
+        temporary.replace(target)
+        temporary_sidecar.replace(_sidecar(target))
+        published = True
+        quarantine, moved = _stage_retention(target_dir, keep, target)
         _record_audit(
             session,
             "backup.created",
             {"path": str(target), "sha256": checksum, "integrity_check": "ok"},
         )
+        if session is not None:
+            session.commit()
+        if quarantine.exists():
+            shutil.rmtree(quarantine, ignore_errors=True)
         return target
+    except Exception:
+        if session is not None and hasattr(session, "rollback"):
+            session.rollback()
+        for original, staged in reversed(moved):
+            if staged.exists():
+                staged.replace(original)
+        if quarantine is not None and quarantine.exists():
+            shutil.rmtree(quarantine, ignore_errors=True)
+        if published:
+            target.unlink(missing_ok=True)
+            _sidecar(target).unlink(missing_ok=True)
+        raise
     finally:
         temporary.unlink(missing_ok=True)
+        temporary_sidecar.unlink(missing_ok=True)
 
 
 def restore_check(path: str | Path, *, session: Session | None = None) -> BackupVerification:
@@ -197,4 +324,12 @@ def restore_check(path: str | Path, *, session: Session | None = None) -> Backup
         "backup.restore_checked",
         {"path": str(candidate), "sha256": result.checksum, "integrity_check": "ok"},
     )
-    return BackupVerification(candidate, result.checksum, result.integrity_check, result.schema_valid)
+    if session is not None:
+        session.commit()
+    return BackupVerification(
+        candidate,
+        result.checksum,
+        result.integrity_check,
+        result.schema_valid,
+        result.schema_revision,
+    )

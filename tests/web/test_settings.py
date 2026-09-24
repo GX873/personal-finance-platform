@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -36,11 +37,32 @@ def valid_form(client):
     }
 
 
-@pytest.mark.parametrize("path", ["/settings", "/analysis"])
+@pytest.mark.parametrize("path", ["/settings", "/analysis", "/backups"])
 def test_new_pages_require_login(client, path):
     response = client.get(path)
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
+
+
+def test_backups_page_is_read_only_and_lists_recent_verified_backup(
+    client, db_session
+):
+    from finance_app.ops.backup import create_backup
+
+    database = db_session.get_bind().url.database
+    assert database is not None
+    backup = create_backup(database, Path(database).parent / "backups")
+    before = set(backup.parent.iterdir())
+    assert login(client).status_code == 303
+
+    page = client.get("/backups")
+
+    assert page.status_code == 200
+    assert backup.name in page.text
+    assert "ok" in page.text
+    assert set(backup.parent.iterdir()) == before
+    home = client.get("/")
+    assert 'href="/backups"' in home.text
 
 
 def test_settings_never_render_or_accept_credentials(client, monkeypatch):

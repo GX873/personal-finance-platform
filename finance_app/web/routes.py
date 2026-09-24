@@ -32,6 +32,7 @@ from finance_app.ledger.models import (
 from finance_app.ledger.schemas import PostTransaction
 from finance_app.ledger.service import post_transaction, reverse_transaction
 from finance_app.notifications.models import AppSetting, NotificationChannel
+from finance_app.ops.backup import backup_directory, recent_backup_statuses
 from finance_app.portfolio.models import (
     Alert,
     AllocationTarget,
@@ -332,6 +333,18 @@ def settings_page(request: Request, db: Annotated[Session, Depends(get_db)]):
     if user is None:
         return RedirectResponse("/login", status_code=303)
     return _settings_page(request, db, user)
+
+
+@router.get("/backups", response_class=HTMLResponse)
+def backups_page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    context = _base_context(request, user, "backups")
+    context["backups"] = recent_backup_statuses(backup_directory(db))
+    return templates.TemplateResponse(
+        request=request, name="backups.html", context=context
+    )
 
 
 @router.post("/settings", dependencies=[Depends(require_csrf)])
