@@ -16,7 +16,7 @@ Updated: 2026-09-24
 - [x] Task 12: Daily checks and settings; reviewed at 29f9514 (399 tests).
 - [x] Task 13: Exports, backups and restore verification; reviewed at 5b785f7 (416 tests).
 - [x] Task 14: Ubuntu deployment artifacts; reviewed at 37145ab (426 tests; bash -n deferred to Ubuntu because local WSL lacks /bin/bash).
-- [ ] Task 15: Release checks and operating documentation.
+- [x] Task 15: Release checks and operating documentation; committed at df8201a (security regressions 4 passed; full suite 426 passed; local bash -n deferred because WSL lacks /bin/bash).
 - [ ] Task 16: Server deployment and acceptance.
 
 ## Verified Environment
