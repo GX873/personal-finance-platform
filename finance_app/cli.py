@@ -40,6 +40,8 @@ from finance_app.notifications.models import (
 )
 from finance_app.notifications.service import NotificationDeliveryService
 from finance_app.notifications.wechat import build_wechat_notifier
+from finance_app.ops.backup import create_backup, restore_check
+from finance_app.ops.export import ExportService
 from finance_app.portfolio.models import (
     AllocationTarget,
     PortfolioSnapshot,
@@ -822,10 +824,44 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--date", type=_iso_date)
     mode.add_argument("--scheduled", action="store_true")
     daily.add_argument("--dry-run", action="store_true")
+    backup = commands.add_parser("backup")
+    backup.add_argument("--directory", default=None)
+    backup.add_argument("--keep", type=int, default=14)
+    restore = commands.add_parser("restore-check")
+    restore.add_argument("path")
+    export = commands.add_parser("export")
+    export.add_argument("--directory", required=True)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 1
+    if args.command == "backup":
+        try:
+            with get_session_factory()() as db:
+                backup_path = create_backup(db, args.directory, keep=args.keep, session=db)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Backup failed: {exc}", file=sys.stderr)
+            return 1
+        print(backup_path)
+        return 0
+    if args.command == "restore-check":
+        try:
+            with get_session_factory()() as db:
+                restore_result = restore_check(args.path, session=db)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Restore check failed: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"{restore_result.path} integrity={restore_result.integrity_check} "
+            f"sha256={restore_result.checksum}"
+        )
+        return 0
+    if args.command == "export":
+        with get_session_factory()() as db:
+            export_paths = ExportService(db).export_all(args.directory)
+        for path in export_paths.values():
+            print(path)
+        return 0
     if args.command != "daily-check":
         return _password_command(args)
     with get_session_factory()() as db:
@@ -837,12 +873,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         check = DailyCheck(db, dry_run=args.dry_run)
         if args.scheduled:
-            result = check.run_scheduled()
+            daily_result = check.run_scheduled()
         else:
             assert isinstance(args.date, date)
-            result = check.run(args.date)
-    print(result.value)
-    return 1 if result is DailyCheckResult.FAILED else 0
+            daily_result = check.run(args.date)
+    print(daily_result.value)
+    return 1 if daily_result is DailyCheckResult.FAILED else 0
 
 
 if __name__ == "__main__":

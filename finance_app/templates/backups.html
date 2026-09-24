@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<main class="page-shell">
+  <h1>备份与导出</h1>
+  <p>备份由命令行任务在线创建，并在通过完整性校验后保留最新 14 份。</p>
+  <p>恢复前请运行 <code>finance restore-check PATH</code>；该检查不会覆盖线上数据库。</p>
+</main>
+{% endblock %}
