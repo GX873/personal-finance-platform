@@ -1,6 +1,6 @@
 # Implementation Progress
 
-Updated: 2026-09-23
+Updated: 2026-09-24
 
 - [x] Task 1: Bootstrap, health route, settings, tests; reviewed and committed.
 - [x] Task 2: Database foundation, frozen migrations, UTC persistence; reviewed, 21 tests passing at a626612.
@@ -12,7 +12,7 @@ Updated: 2026-09-23
 - [x] Task 8: Manual entry, reversals, price entry and audited form actions; reviewed at 4d0f8f8 (152 tests).
 - [x] Task 9: Confirmed CSV/XLSX imports and OCR candidates; reviewed at 62c5b27 (231 tests).
 - [x] Task 10: Traceable EastMoney fund NAV integration; reviewed at 4373e92 (269 tests).
-- [ ] Task 11: Email and WeChat notifications.
+- [x] Task 11: Audited email and WeChat notifications; reviewed at 48c1968 (350 tests).
 - [ ] Task 12: Daily checks and settings.
 - [ ] Task 13: Exports, backups and restore verification.
 - [ ] Task 14: Ubuntu deployment artifacts.
