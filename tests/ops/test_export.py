@@ -28,7 +28,7 @@ def populated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         db.execute("INSERT INTO assets(code,market,name,asset_class,risk_level,portfolio_role,currency,created_at,updated_at) VALUES ('000001','CN','fund','fund','medium','core','CNY',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
         db.execute("INSERT INTO holdings(account_id,asset_id,quantity,cost_cents,is_price_stale,updated_at) VALUES (1,1,1,100,1,CURRENT_TIMESTAMP)")
         db.execute("INSERT INTO transactions(source,external_id,kind,account_id,asset_id,amount_cents,quantity,fee_cents,occurred_at,created_at) VALUES ('manual','tx-1','BUY',1,1,100,1,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
-        db.execute("INSERT INTO audit_events(event_type,details_json,created_at) VALUES ('unsafe','{\"api_key\":\"audit-secret\"}',CURRENT_TIMESTAMP)")
+        db.execute("INSERT INTO audit_events(event_type,details_json,created_at) VALUES ('unsafe','{\"action\":\"kept\",\"api_key\":\"audit-secret\",\"nested\":{\"token\":\"bad\",\"status\":\"ok\"}}',CURRENT_TIMESTAMP)")
         db.commit()
     return path
 
@@ -42,6 +42,8 @@ def test_json_export_keeps_business_tables_but_excludes_secrets(populated_db: Pa
     for secret in ("password-secret", "api_key-secret", "private_key-secret", "smtp_pass-secret", "pushplus_token-secret", "audit-secret"):
         assert secret not in encoded
     assert "password_hash" not in encoded
+    details = payload["tables"]["audit_events"][0]["details_json"]
+    assert details == {"action": "kept", "nested": {"status": "ok"}}
 
 
 def test_export_all_writes_single_bom_and_single_audit(populated_db: Path, tmp_path: Path):
@@ -76,3 +78,38 @@ def test_export_failure_leaves_existing_set_untouched(
     with pytest.raises(RuntimeError, match="serialization"):
         service.export_all(directory)
     assert {name: (directory / name).read_text(encoding="utf-8") for name in old} == old
+
+
+def test_json_export_is_atomic_and_audited_once(populated_db: Path, tmp_path: Path):
+    engine = create_db_engine(f"sqlite:///{populated_db}")
+    session = get_session_factory(engine)()
+    destination = tmp_path / "portfolio.json"
+    try:
+        result = ExportService(populated_db, session=session).export_json(destination)
+        assert result == destination.resolve()
+        assert json.loads(destination.read_text(encoding="utf-8"))["version"] == 1
+        events = list(
+            session.scalars(
+                select(AuditEvent).where(AuditEvent.event_type == "export.completed")
+            )
+        )
+        assert len(events) == 1
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_json_export_failure_does_not_overwrite_existing_file(
+    populated_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    destination = tmp_path / "portfolio.json"
+    destination.write_text("old-json", encoding="utf-8")
+    service = ExportService(populated_db)
+
+    def fail_json(*args, **kwargs):
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(service, "_json_payload", fail_json)
+    with pytest.raises(RuntimeError, match="serialization"):
+        service.export_json(destination)
+    assert destination.read_text(encoding="utf-8") == "old-json"

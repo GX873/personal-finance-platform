@@ -23,7 +23,7 @@ _EXPORT_FIELDS: dict[str, tuple[str, ...]] = {
     "alerts": ("id", "alert_type", "severity", "message", "status", "created_at", "resolved_at"),
     "allocation_targets": ("id", "name", "target_bps", "upper_bps", "created_at", "updated_at"),
     "assets": ("id", "code", "market", "name", "asset_class", "risk_level", "portfolio_role", "currency", "created_at", "updated_at"),
-    "audit_events": ("id", "event_type", "entity_type", "entity_id", "created_at"),
+    "audit_events": ("id", "event_type", "entity_type", "entity_id", "details_json", "created_at"),
     "cash_buckets": ("id", "bucket_kind", "balance_cents", "updated_at"),
     "holdings": ("id", "account_id", "asset_id", "quantity", "cost_cents", "valuation_cents", "last_price", "price_source", "price_fetched_at", "is_price_stale", "updated_at"),
     "import_batches": ("id", "sha256", "filename", "source", "imported_at"),
@@ -37,6 +37,19 @@ _EXPORT_FIELDS: dict[str, tuple[str, ...]] = {
     "users": ("id", "username", "is_active", "created_at", "updated_at"),
 }
 _SAFE_SETTING_KEYS = {"daily_schedule", "reserve_target_cents", "stale_threshold_hours"}
+_SECRET_MARKERS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "private_key",
+    "secret",
+    "sendkey",
+    "smtp_pass",
+    "token",
+    "webhook",
+)
+_REMOVED = object()
 
 
 def _json_value(value: Any) -> Any:
@@ -46,6 +59,30 @@ def _json_value(value: Any) -> Any:
         return str(value)
     if hasattr(value, "value"):
         return value.value
+    return value
+
+
+def _sanitize_audit_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, nested in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if any(marker in normalized for marker in _SECRET_MARKERS):
+                continue
+            cleaned = _sanitize_audit_value(nested)
+            if cleaned is not _REMOVED:
+                safe[str(key)] = cleaned
+        return safe
+    if isinstance(value, list):
+        return [
+            cleaned
+            for item in value
+            if (cleaned := _sanitize_audit_value(item)) is not _REMOVED
+        ]
+    if isinstance(value, str):
+        normalized = value.lower().replace("-", "_")
+        if any(marker in normalized for marker in _SECRET_MARKERS):
+            return _REMOVED
     return value
 
 
@@ -86,6 +123,14 @@ class ExportService:
         finally:
             db.close()
         tables["app_settings"] = [row for row in settings if row.get("key") in _SAFE_SETTING_KEYS]
+        for row in tables["audit_events"]:
+            raw = row.get("details_json")
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else {}
+            except (TypeError, ValueError):
+                parsed = {}
+            cleaned = _sanitize_audit_value(parsed)
+            row["details_json"] = cleaned if isinstance(cleaned, (dict, list)) else {}
         return {"version": 1, "source_timestamp": self.clock().isoformat(), "tables": tables}
 
     @staticmethod
@@ -126,11 +171,49 @@ class ExportService:
     def export_json(self, path: str | Path) -> Path:
         destination = Path(path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps(self.to_json(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        with tempfile.TemporaryDirectory(
+            prefix=".finance-json-export-", dir=destination.parent
+        ) as work:
+            staging = Path(work)
+            snapshot = self._snapshot(staging)
+            staged_json = staging / destination.name
+            staged_json.write_text(
+                json.dumps(
+                    self._json_payload(snapshot),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            saved = staging / "previous.json"
+            had_previous = destination.exists()
+            try:
+                if had_previous:
+                    destination.replace(saved)
+                staged_json.replace(destination)
+                self._record_completed({"format": "json", "path": str(destination)})
+            except Exception:
+                if self.session is not None:
+                    self.session.rollback()
+                destination.unlink(missing_ok=True)
+                if had_previous and saved.exists():
+                    saved.replace(destination)
+                raise
         return destination
+
+    def _record_completed(self, details: dict[str, str]) -> None:
+        if self.session is None:
+            return
+        self.session.add(
+            AuditEvent(
+                event_type="export.completed",
+                entity_type="export",
+                details_json=json.dumps(details, sort_keys=True),
+            )
+        )
+        self.session.commit()
 
     def export_all(self, directory: str | Path) -> dict[str, Path]:
         destination = Path(directory).expanduser().resolve()
@@ -161,15 +244,9 @@ class ExportService:
                     final = destination / name
                     (staging / name).replace(final)
                     published.append(final)
-                if self.session is not None:
-                    self.session.add(
-                        AuditEvent(
-                            event_type="export.completed",
-                            entity_type="export",
-                            details_json=json.dumps({"format": "csv+json", "directory": str(destination)}, sort_keys=True),
-                        )
-                    )
-                    self.session.commit()
+                self._record_completed(
+                    {"format": "csv+json", "directory": str(destination)}
+                )
             except Exception:
                 if self.session is not None:
                     self.session.rollback()

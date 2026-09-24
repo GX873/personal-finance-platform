@@ -275,8 +275,8 @@ def create_backup(
         checksum = verification.checksum
         temporary_sidecar.write_text(f"{checksum}  {target.name}\n", encoding="ascii")
         temporary.replace(target)
-        temporary_sidecar.replace(_sidecar(target))
         published = True
+        temporary_sidecar.replace(_sidecar(target))
         quarantine, moved = _stage_retention(target_dir, keep, target)
         _record_audit(
             session,

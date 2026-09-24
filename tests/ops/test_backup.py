@@ -97,6 +97,25 @@ def test_audit_failure_removes_new_files_and_preserves_old_backup(
     assert existing.with_name(existing.name + ".sha256").exists()
 
 
+def test_sidecar_publish_failure_removes_new_database_and_preserves_old_backup(
+    populated_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    directory = tmp_path / "backups"
+    existing = create_backup(populated_db, directory)
+    original_replace = Path.replace
+
+    def fail_sidecar_replace(path: Path, target: Path):
+        if str(path).endswith(".sha256.tmp"):
+            raise OSError("sidecar publish failed")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_sidecar_replace)
+    with pytest.raises(OSError, match="sidecar"):
+        create_backup(populated_db, directory, clock=fixed_clock)
+    assert list(directory.glob("*.sqlite3")) == [existing]
+    assert existing.with_name(existing.name + ".sha256").exists()
+
+
 def test_environment_secret_is_not_copied_into_backup(
     populated_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
