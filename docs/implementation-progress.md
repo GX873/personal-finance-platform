@@ -17,7 +17,7 @@ Updated: 2026-09-24
 - [x] Task 13: Exports, backups and restore verification; reviewed at 5b785f7 (416 tests).
 - [x] Task 14: Ubuntu deployment artifacts; reviewed at 37145ab (426 tests; bash -n deferred to Ubuntu because local WSL lacks /bin/bash).
 - [x] Task 15: Release checks and operating documentation; committed at df8201a (security regressions 4 passed; full suite 430 passed; local bash -n deferred because WSL lacks /bin/bash).
-- [ ] Task 16: Server deployment and acceptance.
+- [ ] Task 16: Server deployment and acceptance (application, login, dry-run and backup verified at add1954; external TCP 80, notifications and confirmed portfolio import remain user-gated).
 
 ## Verified Environment
 
@@ -25,7 +25,7 @@ Updated: 2026-09-24
 - Branch: `feature/personal-finance`.
 - SSH access verified; server has about 1.1 GiB available memory and 33 GiB available disk.
 - SSH and Alibaba Cloud management/backup services active.
-- Finance application not yet deployed.
+- Finance application deployed at `add1954`; external TCP 80 remains closed in the Alibaba Cloud security group.
 
 ## External Configuration
 
