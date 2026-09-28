@@ -162,13 +162,96 @@ Do not delete the current release during rollback. If a migration has changed
 the schema, restore a verified backup first and follow the documented migration
 plan; never run an unreviewed downgrade against the only database.
 
-## HTTP-only bootstrap and TLS warning
+## Tailscale private HTTPS access
 
-The installer starts with `FINANCE_SESSION_HTTPS_ONLY=false` because a fresh
-host may not have a certificate yet. This is acceptable only on a private,
-temporary bootstrap network. HTTP exposes login cookies and credentials to
-network observers. Configure TLS termination in Nginx, verify redirects and
-certificate renewal, then set `FINANCE_SESSION_HTTPS_ONLY=true`, reload the
-environment, and restart the app. Restrict cloud security-group rules to the
-needed clients; do not treat an unencrypted public port 80 as finished
-deployment.
+The supported remote entry point is Tailnet-only HTTPS through Tailscale
+Serve. Nginx and Uvicorn remain bound to loopback. Do not enable Tailscale
+Funnel: Funnel publishes a service to the public internet and is outside this
+deployment's security boundary.
+
+Install Tailscale from its official Ubuntu 24.04 repository:
+
+```bash
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+  -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+  -o /etc/apt/sources.list.d/tailscale.list
+apt-get update
+apt-get install -y tailscale
+systemctl enable --now tailscaled
+```
+
+Join the server to the owner's personal Tailnet without enabling Tailscale
+SSH or accepting routes:
+
+```bash
+tailscale up --ssh=false --accept-routes=false --accept-dns=true
+```
+
+Open the one-time `https://login.tailscale.com/...` URL printed by the command
+only in the owner's browser. Confirm the intended Tailnet before approving the
+server. Never paste the login URL, device key, auth key, or Tailnet credentials
+into source control, logs, or chat history.
+
+After authorization, enable persistent Tailnet-only HTTPS proxying:
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:80
+tailscale status
+tailscale serve status
+tailscale funnel status
+```
+
+If Tailscale asks to enable HTTPS certificates, open its admin URL, enable
+certificates for this Tailnet, and repeat the `tailscale serve` command. The
+Serve status must show the assigned `.ts.net` HTTPS endpoint. The Funnel
+status must show that no public service is active.
+
+Before changing Nginx listeners or Alibaba Cloud rules, install Tailscale on
+one client, sign in to the same account, open the `.ts.net` address, and verify
+the login, dashboard, and settings pages. Then confirm the production boundary:
+
+```bash
+nginx -t
+ss -lntp | grep -E ':(80|8000)\b'
+curl --fail --silent http://127.0.0.1/health
+systemctl is-active tailscaled nginx finance-app finance-daily.timer finance-backup.timer
+tailscale serve status
+tailscale funnel status
+```
+
+Nginx must listen only on `127.0.0.1:80` and `[::1]:80`; Uvicorn must listen
+only on `127.0.0.1:8000`. Keep `FINANCE_SESSION_HTTPS_ONLY=true` so the login
+cookie is never sent over HTTP. From a device disconnected from Tailscale,
+verify that the ECS public IP cannot be reached on TCP 80, 443, or 8000. Do not
+add public website rules to the Alibaba Cloud security group. Keep the existing
+source-restricted TCP 22 rule for maintenance and recovery.
+
+On each computer or phone, install the official Tailscale client, sign in to
+the same account, and bookmark the `.ts.net` HTTPS address. No SSH command or
+long-running PowerShell window is required for ordinary access. Disconnecting
+or signing out of Tailscale must make the site unavailable.
+
+## Tailscale recovery
+
+Before changing the live Nginx configuration, create a root-owned recovery
+copy:
+
+```bash
+install -o root -g root -m 0644 \
+  /etc/nginx/sites-available/personal-finance \
+  /etc/nginx/sites-available/personal-finance.pre-tailscale
+```
+
+If private HTTPS fails after the change, keep the database and application
+state untouched. Disable Serve and restore the previous Nginx file:
+
+```bash
+tailscale serve reset
+cp /etc/nginx/sites-available/personal-finance.pre-tailscale \
+  /etc/nginx/sites-available/personal-finance
+nginx -t && systemctl reload nginx
+```
+
+Use the existing restricted SSH entry point for recovery. Do not remove
+Tailscale state or relax public firewall rules while diagnosing the failure.

@@ -24,8 +24,15 @@ def test_nginx_denies_private_state_paths() -> None:
 
 def test_operations_and_release_artifacts_exist_with_security_guidance() -> None:
     required = {
-        "README.md": ("HTTP-only bootstrap", "TLS"),
-        "docs/operations.md": ("restore-check", "rollback", "timer"),
+        "README.md": ("公网 HTTP", "TLS"),
+        "docs/operations.md": (
+            "restore-check",
+            "rollback",
+            "timer",
+            "Tailscale",
+            "Funnel",
+            "tailscale serve",
+        ),
         "docs/data-import.md": ("CSV", "XLSX", "OCR", "confirmation"),
         "scripts/release-check.sh": ("pytest", "mypy", "Ruff", "mktemp"),
     }
