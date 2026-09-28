@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}账户与基金{% endblock %}
+{% block eyebrow %}SETUP{% endblock %}
+{% block heading %}先把钱和基金放对位置。{% endblock %}
+{% block subtitle %}所有期初金额按人民币分精确保存；系统不会自动创建任何记录。{% endblock %}
+{% block content %}
+{% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+<div class="form-grid">
+  <section class="panel"><div class="section-heading"><h2>新增账户</h2><span class="pill">人民币</span></div>
+    <form class="manual-form" method="post" action="/accounts">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>账户名称<input required maxlength="200" name="name" value="{{ account_values.get('name', '') }}"></label>
+      <label>账户类型<select name="kind"><option value="cash">现金</option><option value="bank">银行卡</option><option value="brokerage">证券账户</option></select></label>
+      <label>币种<input readonly name="currency" value="CNY"></label>
+      <label>期初余额（元）<input required inputmode="decimal" name="opening_balance" value="{{ account_values.get('opening_balance', '0.00') }}"></label>
+      <button type="submit">保存账户</button>
+    </form>
+    {% if accounts %}<ul class="record-list">{% for account in accounts %}<li><strong>{{ account.name }}</strong><span>{{ account.kind }} · ¥ {{ account.opening_balance_cents|money }}</span></li>{% endfor %}</ul>{% endif %}
+  </section>
+  <section class="panel"><div class="section-heading"><h2>新增基金</h2><span class="pill">CN / CNY</span></div>
+    <form class="manual-form" method="post" action="/assets">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>基金代码<input required maxlength="64" name="code" value="{{ asset_values.get('code', '') }}"></label>
+      <label>基金名称<input required maxlength="200" name="name" value="{{ asset_values.get('name', '') }}"></label>
+      <label>风险等级<select name="risk_level"><option value="low">低</option><option value="medium" selected>中</option><option value="high">高</option></select></label>
+      <label>组合角色<select name="portfolio_role"><option value="core">核心</option><option value="satellite">卫星</option></select></label>
+      <button type="submit">保存基金</button>
+    </form>
+    {% if assets %}<ul class="record-list">{% for asset in assets %}<li><strong>{{ asset.name }}</strong><span>{{ asset.code }} · {{ asset.risk_level }} / {{ asset.portfolio_role }}</span></li>{% endfor %}</ul>{% endif %}
+  </section>
+</div>
+{% endblock %}

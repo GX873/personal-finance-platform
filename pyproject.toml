@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-finance"
+version = "0.1.0"
+description = "A single-user personal finance platform"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy",
+    "alembic",
+    "jinja2",
+    "python-multipart",
+    "pydantic-settings",
+    "argon2-cffi",
+    "itsdangerous",
+    "httpx",
+    "openpyxl",
+    "Pillow",
+    "pytesseract",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+market-analysis = [
+    "efinance==0.5.9",
+    "xalpha==0.12.4",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+finance = "finance_app.cli:main"
+
+[tool.setuptools.package-data]
+finance_app = ["templates/*.html", "static/*.css", "static/*.js", "static/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["finance_app*"]

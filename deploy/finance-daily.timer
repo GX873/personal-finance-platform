@@ -1,0 +1,10 @@
+[Unit]
+Description=Run personal finance daily check window
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+Unit=finance-daily.service
+
+[Install]
+WantedBy=timers.target

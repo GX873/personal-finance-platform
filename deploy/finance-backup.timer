@@ -1,0 +1,10 @@
+[Unit]
+Description=Run personal finance backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=finance-backup.service
+
+[Install]
+WantedBy=timers.target

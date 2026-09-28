@@ -1,0 +1,1 @@
+"""Authenticated server-rendered views."""

@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Callable, Mapping
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from typing import Self
+
+import httpx
+
+from finance_app.db import utc_now
+from finance_app.market.base import (
+    FundNavQuote,
+    MarketDataError,
+    validate_storable_nav,
+)
+
+EASTMONEY_NAV_URL = "https://api.fund.eastmoney.com/f10/lsjz"
+EASTMONEY_REFERER = "https://fundf10.eastmoney.com/"
+TOTAL_ATTEMPTS = 3
+MAX_RESPONSE_BYTES = 1_000_000
+_FUND_CODE = re.compile(r"[0-9]{6}\Z", re.ASCII)
+_NAV = re.compile(r"[0-9]+(?:\.[0-9]+)?\Z", re.ASCII)
+
+
+class EastMoneyFundNavProvider:
+    source = "eastmoney"
+    source_url = EASTMONEY_NAV_URL
+
+    def __init__(
+        self,
+        *,
+        client: httpx.Client | None = None,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        self._owns_client = client is None
+        self._client = client if client is not None else httpx.Client()
+        self._clock = clock
+        self._timeout = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=3.0)
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def fetch(self, fund_code: str) -> FundNavQuote:
+        if not isinstance(fund_code, str) or _FUND_CODE.fullmatch(fund_code) is None:
+            raise ValueError("fund code must contain exactly six ASCII digits")
+
+        params = {"fundCode": fund_code, "pageIndex": "1", "pageSize": "1"}
+        request_url = str(httpx.URL(self.source_url, params=params))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36"
+            ),
+            "Referer": EASTMONEY_REFERER,
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        for attempt in range(1, TOTAL_ATTEMPTS + 1):
+            try:
+                with self._client.stream(
+                    "GET",
+                    self.source_url,
+                    params=params,
+                    headers=headers,
+                    timeout=self._timeout,
+                ) as response:
+                    response_url = str(response.request.url)
+                    if response.status_code != httpx.codes.OK:
+                        retryable = (
+                            response.status_code == 429 or response.status_code >= 500
+                        )
+                        if retryable and attempt < TOTAL_ATTEMPTS:
+                            continue
+                        raise self._error(
+                            "upstream_http",
+                            response_url,
+                            attempt,
+                            "upstream_http: eastmoney returned "
+                            f"HTTP {response.status_code}",
+                        )
+
+                    try:
+                        content = self._read_response(response)
+                        quote_date, value = self._parse_response(content)
+                    except (
+                        httpx.DecodingError,
+                        ValueError,
+                        TypeError,
+                        InvalidOperation,
+                    ):
+                        raise self._error(
+                            "invalid_response",
+                            response_url,
+                            attempt,
+                            "invalid_response: eastmoney returned an invalid "
+                            "daily NAV payload",
+                        ) from None
+            except httpx.TimeoutException:
+                if attempt < TOTAL_ATTEMPTS:
+                    continue
+                raise self._error(
+                    "upstream_timeout",
+                    request_url,
+                    attempt,
+                    f"upstream_timeout: eastmoney request failed after {attempt} attempts",
+                ) from None
+            except httpx.RequestError:
+                if attempt < TOTAL_ATTEMPTS:
+                    continue
+                raise self._error(
+                    "upstream_network",
+                    request_url,
+                    attempt,
+                    f"upstream_network: eastmoney request failed after {attempt} attempts",
+                ) from None
+            return FundNavQuote(
+                value=value,
+                valuation_date=quote_date,
+                source=self.source,
+                source_url=response_url,
+                fetched_at=self._clock(),
+                attempts=attempt,
+            )
+
+        raise AssertionError("bounded retry loop exited unexpectedly")
+
+    def _read_response(self, response: httpx.Response) -> bytes:
+        content = bytearray()
+        for chunk in response.iter_bytes():
+            if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
+                raise ValueError("response exceeds size limit")
+            content.extend(chunk)
+        return bytes(content)
+
+    def _parse_response(self, content: bytes) -> tuple[date, Decimal]:
+        payload = json.loads(content)
+        if not isinstance(payload, Mapping):
+            raise TypeError("response must be an object")
+        data = payload.get("Data")
+        if not isinstance(data, Mapping):
+            raise TypeError("Data must be an object")
+        rows = data.get("LSJZList")
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], Mapping):
+            raise ValueError("LSJZList must contain a row")
+        raw_date = rows[0].get("FSRQ")
+        raw_value = rows[0].get("DWJZ")
+        if not isinstance(raw_date, str):
+            raise TypeError("FSRQ must be a string")
+        quote_date = date.fromisoformat(raw_date)
+        if quote_date.isoformat() != raw_date:
+            raise ValueError("FSRQ must use YYYY-MM-DD")
+        if not isinstance(raw_value, str) or _NAV.fullmatch(raw_value) is None:
+            raise ValueError("DWJZ must be a decimal string")
+        value = Decimal(raw_value)
+        validate_storable_nav(value)
+        return quote_date, value
+
+    def _error(
+        self, code: str, source_url: str, attempts: int, summary: str
+    ) -> MarketDataError:
+        return MarketDataError(
+            code=code,
+            source=self.source,
+            source_url=source_url,
+            fetched_at=self._clock(),
+            attempts=attempts,
+            summary=summary,
+        )

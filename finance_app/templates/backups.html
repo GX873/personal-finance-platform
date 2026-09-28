@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}备份与导出{% endblock %}
+{% block eyebrow %}BACKUPS{% endblock %}
+{% block heading %}备份状态，一目了然。{% endblock %}
+{% block subtitle %}这里只展示服务器已经生成的备份，不会从网页创建或恢复数据库。{% endblock %}
+{% block content %}
+<section class="panel" aria-labelledby="backup-list-title">
+  <div class="panel-heading">
+    <div><p class="eyebrow">VERIFIED COPIES</p><h2 id="backup-list-title">最近备份</h2></div>
+  </div>
+  {% if backups %}
+  <div class="table-wrap"><table><thead><tr><th>文件</th><th>时间</th><th>大小</th><th>完整性</th><th>应用模式</th></tr></thead><tbody>
+  {% for backup in backups %}<tr><td>{{ backup.path.name }}</td><td>{{ backup.modified_at|shanghai_datetime }}</td><td>{{ backup.size_bytes }} B</td><td>{{ backup.integrity_check }}</td><td>{{ '有效' if backup.schema_valid else '无效' }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="empty">还没有备份。请通过服务器计划任务或 <code>finance backup</code> 创建。</p>{% endif %}
+  <p class="helper">恢复前请运行 <code>finance restore-check PATH</code>。检查只使用临时副本，不会覆盖线上数据库。</p>
+</section>
+{% endblock %}

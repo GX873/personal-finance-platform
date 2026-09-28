@@ -1,0 +1,28 @@
+[Unit]
+Description=Personal finance web application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=financeapp
+Group=financeapp
+WorkingDirectory=/opt/personal-finance/current
+EnvironmentFile=/etc/personal-finance/finance.env
+ExecStart=/opt/personal-finance/current/.venv/bin/uvicorn finance_app.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/personal-finance/data
+ReadWritePaths=/var/lib/personal-finance/uploads
+MemoryMax=300M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

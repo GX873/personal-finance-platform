@@ -1,0 +1,978 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated, Any
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from finance_app.auth.models import User
+from finance_app.auth.routes import templates
+from finance_app.auth.service import (
+    csrf_token,
+    current_user,
+    require_csrf,
+    require_user,
+)
+from finance_app.calendar import parse_holidays, serialize_holidays
+from finance_app.config import get_settings
+from finance_app.db import get_db, utc_now
+from finance_app.ledger.models import (
+    Account,
+    Asset,
+    CashBucket,
+    Transaction,
+)
+from finance_app.ledger.schemas import PostTransaction
+from finance_app.ledger.service import post_transaction, reverse_transaction
+from finance_app.notifications.models import AppSetting, NotificationChannel
+from finance_app.ops.backup import backup_directory, recent_backup_statuses
+from finance_app.portfolio.models import (
+    Alert,
+    AllocationTarget,
+    PortfolioSnapshot,
+    PriceSnapshot,
+)
+from finance_app.web.forms import (
+    SHANGHAI,
+    FormError,
+    audit_event,
+    manual_source,
+    parse_date,
+    parse_decimal,
+    parse_id,
+    parse_local_datetime,
+    parse_yuan,
+    required_text,
+)
+from finance_app.web.viewmodels import dashboard, money
+
+router = APIRouter()
+
+_SETTING_FIELDS = {
+    "csrf_token",
+    "daily_schedule",
+    "cn_holidays",
+    "reserve_target",
+    "core_target_percent",
+    "satellite_target_percent",
+    "satellite_upper_percent",
+    "stale_threshold_hours",
+    "enabled_channels",
+}
+_CHANNEL_TYPES = ("email", "pushplus", "serverchan", "wecom")
+_CHANNEL_LABELS = {
+    "email": "邮件",
+    "pushplus": "PushPlus",
+    "serverchan": "Server酱",
+    "wecom": "企业微信",
+}
+_SCHEDULE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z", re.ASCII)
+
+
+def shanghai_datetime(value: datetime) -> str:
+    return value.astimezone(SHANGHAI).strftime("%Y-%m-%d %H:%M")
+
+
+templates.env.filters["money"] = money
+templates.env.filters["shanghai_datetime"] = shanghai_datetime
+
+
+def _today() -> str:
+    return utc_now().astimezone(SHANGHAI).date().isoformat()
+
+
+def _base_context(request: Request, user: User, section: str) -> dict[str, Any]:
+    return {
+        "user": user,
+        "csrf_token": csrf_token(request),
+        "section": section,
+        "demo": False,
+        "vm": {"today": _today()},
+    }
+
+
+def _form_values(form: Any) -> dict[str, str]:
+    return {key: value for key, value in form.items() if isinstance(value, str)}
+
+
+def _stored_setting(db: Session, key: str, default: str) -> str:
+    value = db.scalar(select(AppSetting.value).where(AppSetting.key == key))
+    return value if value is not None else default
+
+
+def _credential_statuses() -> dict[str, bool]:
+    settings = get_settings()
+    return {
+        "email": settings.smtp_authorization_code is not None,
+        "pushplus": settings.pushplus_token is not None,
+        "serverchan": settings.serverchan_sendkey is not None,
+        "wecom": settings.wecom_webhook_url is not None,
+    }
+
+
+def _channel_options(db: Session) -> list[tuple[str, str, str]]:
+    rows = list(
+        db.scalars(select(NotificationChannel).order_by(NotificationChannel.id))
+    )
+    if rows:
+        return [
+            (row.name, row.name, row.channel_type)
+            for row in rows
+            if row.channel_type in _CHANNEL_TYPES
+        ]
+    return [(channel, _CHANNEL_LABELS[channel], channel) for channel in _CHANNEL_TYPES]
+
+
+def _settings_values(db: Session) -> dict[str, object]:
+    targets = {row.name: row for row in db.scalars(select(AllocationTarget)).all()}
+    enabled = set(
+        db.scalars(
+            select(NotificationChannel.name).where(
+                NotificationChannel.enabled.is_(True)
+            )
+        )
+    )
+    core = targets.get("core")
+    satellite = targets.get("satellite")
+    satellite_each = targets.get("satellite_each")
+    return {
+        "daily_schedule": _stored_setting(db, "daily_schedule", "14:00"),
+        "cn_holidays": _stored_setting(db, "cn_holidays", "[]"),
+        "reserve_target": money(
+            int(_stored_setting(db, "reserve_target_cents", "100000"))
+        ).replace(",", ""),
+        "core_target_percent": f"{(core.target_bps if core else 7000) / 100:.2f}",
+        "satellite_target_percent": (
+            f"{(satellite.target_bps if satellite else 3000) / 100:.2f}"
+        ),
+        "satellite_upper_percent": f"{(satellite_each.upper_bps if satellite_each and satellite_each.upper_bps is not None else 1000) / 100:.2f}",
+        "stale_threshold_hours": _stored_setting(db, "stale_threshold_hours", "36"),
+        "enabled_channels": enabled,
+    }
+
+
+def _settings_page(
+    request: Request,
+    db: Session,
+    user: User,
+    *,
+    status_code: int = 200,
+    error: str | None = None,
+    values: dict[str, object] | None = None,
+):
+    context = _base_context(request, user, "settings")
+    context.update(
+        {
+            "error": error,
+            "values": values or _settings_values(db),
+            "credential_statuses": _credential_statuses(),
+            "channels": _channel_options(db),
+        }
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="settings.html",
+        context=context,
+        status_code=status_code,
+    )
+
+
+def _upsert_setting(db: Session, key: str, value: str) -> None:
+    row = db.scalar(select(AppSetting).where(AppSetting.key == key))
+    if row is None:
+        db.add(AppSetting(key=key, value=value))
+    else:
+        row.value = value
+
+
+def _upsert_target(
+    db: Session, name: str, target_bps: int, upper_bps: int | None
+) -> None:
+    row = db.scalar(select(AllocationTarget).where(AllocationTarget.name == name))
+    if row is None:
+        db.add(AllocationTarget(name=name, target_bps=target_bps, upper_bps=upper_bps))
+    else:
+        row.target_bps = target_bps
+        row.upper_bps = upper_bps
+
+
+def _manual_page(
+    request: Request,
+    db: Session,
+    user: User,
+    *,
+    name: str,
+    section: str,
+    status_code: int = 200,
+    error: str | None = None,
+    values: dict[str, str] | None = None,
+    account_values: dict[str, str] | None = None,
+    asset_values: dict[str, str] | None = None,
+    editing_price_id: int | None = None,
+):
+    context = _base_context(request, user, section)
+    context.update(
+        {
+            "accounts": list(db.scalars(select(Account).order_by(Account.name))),
+            "assets": list(db.scalars(select(Asset).order_by(Asset.code))),
+            "error": error,
+            "values": values or {},
+            "account_values": account_values or {},
+            "asset_values": asset_values or {},
+            "local_now": datetime.now(SHANGHAI).strftime("%Y-%m-%dT%H:%M"),
+            "price_rows": (
+                list(
+                    db.scalars(
+                        select(PriceSnapshot)
+                        .order_by(
+                            PriceSnapshot.valuation_date.desc(),
+                            PriceSnapshot.id.desc(),
+                        )
+                        .limit(100)
+                    )
+                )
+                if name == "price_form.html"
+                else []
+            ),
+            "price_asset_names": {
+                row.id: row.name for row in db.scalars(select(Asset))
+            },
+            "editing_price_id": editing_price_id,
+        }
+    )
+    return templates.TemplateResponse(
+        request=request, name=name, context=context, status_code=status_code
+    )
+
+
+@router.get("/", response_class=HTMLResponse)
+@router.get("/holdings", response_class=HTMLResponse)
+@router.get("/alerts", response_class=HTMLResponse)
+def page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    section = {"/": "dashboard", "/holdings": "holdings", "/alerts": "alerts"}[
+        request.url.path
+    ]
+    return templates.TemplateResponse(
+        request=request,
+        name=f"{section}.html",
+        context={
+            "user": user,
+            "csrf_token": csrf_token(request),
+            "section": section,
+            "demo": False,
+            "vm": dashboard(db, section=section),
+        },
+    )
+
+
+def _transactions_page(
+    request: Request,
+    db: Session,
+    user: User,
+    *,
+    status_code: int = 200,
+    error: str | None = None,
+):
+    context = _base_context(request, user, "transactions")
+    rows = list(
+        db.scalars(
+            select(Transaction)
+            .order_by(Transaction.occurred_at.desc(), Transaction.id.desc())
+            .limit(100)
+        )
+    )
+    context.update(
+        {
+            "transactions": rows,
+            "account_names": {
+                row.id: row.name for row in db.scalars(select(Account))
+            },
+            "asset_names": {row.id: row.name for row in db.scalars(select(Asset))},
+            "reversed_ids": {
+                row.reverses_transaction_id
+                for row in rows
+                if row.reverses_transaction_id is not None
+            },
+            "error": error,
+        }
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="transactions.html",
+        context=context,
+        status_code=status_code,
+    )
+
+
+@router.get("/transactions", response_class=HTMLResponse)
+def transactions_page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return _transactions_page(request, db, user)
+
+
+@router.get("/transactions/new", response_class=HTMLResponse)
+def transaction_form(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return _manual_page(
+        request, db, user, name="transaction_form.html", section="transactions"
+    )
+
+
+@router.get("/accounts", response_class=HTMLResponse)
+def accounts_page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return _manual_page(request, db, user, name="accounts.html", section="accounts")
+
+
+@router.get("/prices/new", response_class=HTMLResponse)
+def price_form(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return _manual_page(request, db, user, name="price_form.html", section="prices")
+
+
+@router.get("/prices/{price_id}/edit", response_class=HTMLResponse)
+def edit_price_form(
+    price_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    snapshot = db.get(PriceSnapshot, price_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Price not found")
+    if not snapshot.source.startswith("manual:"):
+        raise HTTPException(status_code=403, detail="Only manual prices can be edited")
+    return _manual_page(
+        request,
+        db,
+        user,
+        name="price_form.html",
+        section="prices",
+        values={
+            "asset_id": str(snapshot.asset_id),
+            "valuation_date": snapshot.valuation_date.isoformat(),
+            "price": format(snapshot.price, "f"),
+            "source": snapshot.source,
+        },
+        editing_price_id=snapshot.id,
+    )
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return _settings_page(request, db, user)
+
+
+@router.get("/backups", response_class=HTMLResponse)
+def backups_page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    context = _base_context(request, user, "backups")
+    context["backups"] = recent_backup_statuses(backup_directory(db))
+    return templates.TemplateResponse(
+        request=request, name="backups.html", context=context
+    )
+
+
+@router.post("/settings", dependencies=[Depends(require_csrf)])
+async def update_settings(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    form = await request.form()
+    values: dict[str, object] = {
+        key: value for key, value in _form_values(form).items()
+    }
+    values["enabled_channels"] = set(form.getlist("enabled_channels"))
+    try:
+        unknown = set(form) - _SETTING_FIELDS
+        if unknown:
+            raise FormError("表单包含不允许的字段。")
+        schedule = required_text(form.get("daily_schedule"), "每日时间", maximum=5)
+        if _SCHEDULE.fullmatch(schedule) is None:
+            raise FormError("每日时间须为 24 小时制 HH:MM。")
+        holiday_text = required_text(
+            form.get("cn_holidays") or "[]", "法定节假日", maximum=4096
+        )
+        holidays = parse_holidays(holiday_text)
+        reserve_target = parse_yuan(
+            form.get("reserve_target"), "储备金目标", positive=True
+        )
+        core_bps = parse_yuan(form.get("core_target_percent"), "核心目标比例")
+        satellite_bps = parse_yuan(form.get("satellite_target_percent"), "卫星目标比例")
+        satellite_upper_bps = parse_yuan(
+            form.get("satellite_upper_percent"), "单一卫星上限"
+        )
+        if core_bps > 10000 or satellite_bps > 10000:
+            raise FormError("目标比例须在 0% 至 100% 之间。")
+        if core_bps + satellite_bps != 10000:
+            raise FormError("核心与卫星目标比例之和必须为 100%。")
+        if satellite_upper_bps > satellite_bps:
+            raise FormError("单一卫星上限不能高于全部卫星目标。")
+        stale_text = required_text(
+            form.get("stale_threshold_hours"), "陈旧阈值", maximum=3
+        )
+        if re.fullmatch(r"[1-9][0-9]{0,2}", stale_text) is None:
+            raise FormError("陈旧阈值须为 1 至 720 小时的整数。")
+        stale_hours = int(stale_text)
+        if stale_hours > 720:
+            raise FormError("陈旧阈值须为 1 至 720 小时的整数。")
+        enabled_channels = form.getlist("enabled_channels")
+        existing_channels = list(
+            db.scalars(select(NotificationChannel).order_by(NotificationChannel.id))
+        )
+        if any(row.channel_type not in _CHANNEL_TYPES for row in existing_channels):
+            raise FormError("数据库中存在不支持的通知通道类型。")
+        allowed_names = (
+            {row.name for row in existing_channels}
+            if existing_channels
+            else set(_CHANNEL_TYPES)
+        )
+        if (
+            len(enabled_channels) != len(set(enabled_channels))
+            or not set(enabled_channels) <= allowed_names
+        ):
+            raise FormError("通知通道无效。")
+
+        previous_targets = {
+            row.name: {"target_bps": row.target_bps, "upper_bps": row.upper_bps}
+            for row in db.scalars(select(AllocationTarget)).all()
+        }
+        previous = {
+            "daily_schedule": _stored_setting(db, "daily_schedule", "14:00"),
+            "cn_holidays": _stored_setting(db, "cn_holidays", "[]"),
+            "reserve_target_cents": int(
+                _stored_setting(db, "reserve_target_cents", "100000")
+            ),
+            "stale_threshold_hours": int(
+                _stored_setting(db, "stale_threshold_hours", "36")
+            ),
+            "allocation_targets": previous_targets,
+            "enabled_channels": sorted(
+                row.name for row in existing_channels if row.enabled
+            ),
+        }
+
+        _upsert_setting(db, "daily_schedule", schedule)
+        _upsert_setting(db, "cn_holidays", serialize_holidays(holidays))
+        _upsert_setting(db, "reserve_target_cents", str(reserve_target))
+        _upsert_setting(db, "stale_threshold_hours", str(stale_hours))
+        _upsert_target(db, "core", core_bps, None)
+        _upsert_target(db, "satellite", satellite_bps, None)
+        _upsert_target(db, "satellite_each", 0, satellite_upper_bps)
+        if existing_channels:
+            for channel in existing_channels:
+                channel.enabled = channel.name in enabled_channels
+        else:
+            for channel_type in _CHANNEL_TYPES:
+                db.add(
+                    NotificationChannel(
+                        name=channel_type,
+                        channel_type=channel_type,
+                        enabled=channel_type in enabled_channels,
+                    )
+                )
+        db.flush()
+        db.add(
+            audit_event(
+                user=user,
+                event_type="settings.updated",
+                action="settings.update",
+                entity_type="settings",
+                entity_id=user.id,
+                summary={
+                    "previous": previous,
+                    "daily_schedule": schedule,
+                    "reserve_target_cents": reserve_target,
+                    "core_target_bps": core_bps,
+                    "satellite_target_bps": satellite_bps,
+                    "satellite_upper_bps": satellite_upper_bps,
+                    "stale_threshold_hours": stale_hours,
+                    "enabled_channels": sorted(enabled_channels),
+                },
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        return _settings_page(
+            request,
+            db,
+            user,
+            status_code=422,
+            error=str(exc),
+            values=values,
+        )
+    return RedirectResponse("/settings", status_code=303)
+
+
+@router.get("/analysis", response_class=HTMLResponse)
+def analysis_page(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    snapshot = db.scalar(
+        select(PortfolioSnapshot)
+        .order_by(PortfolioSnapshot.snapshot_date.desc(), PortfolioSnapshot.id.desc())
+        .limit(1)
+    )
+    details: dict[str, Any] = {}
+    if snapshot is not None and snapshot.details_json:
+        try:
+            parsed = json.loads(snapshot.details_json)
+            if isinstance(parsed, dict):
+                details = parsed
+        except (TypeError, ValueError):
+            details = {}
+    context = _base_context(request, user, "analysis")
+    context.update(
+        {
+            "snapshot": snapshot,
+            "snapshot_details": details,
+            "cash_buckets": list(
+                db.scalars(select(CashBucket).order_by(CashBucket.bucket_kind))
+            ),
+        }
+    )
+    return templates.TemplateResponse(
+        request=request, name="analysis.html", context=context
+    )
+
+
+@router.post("/accounts", dependencies=[Depends(require_csrf)])
+async def create_account(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    form = await request.form()
+    values = _form_values(form)
+    try:
+        name = required_text(form.get("name"), "账户名称")
+        kind = required_text(form.get("kind"), "账户类型", maximum=50)
+        if kind not in {"cash", "bank", "brokerage"}:
+            raise FormError("请选择有效的账户类型。")
+        currency = required_text(form.get("currency"), "币种", maximum=3).upper()
+        if currency != "CNY":
+            raise FormError("目前只支持人民币账户。")
+        opening = parse_yuan(form.get("opening_balance"), "期初余额")
+        account = Account(
+            name=name,
+            kind=kind,
+            currency=currency,
+            opening_balance_cents=opening,
+        )
+        db.add(account)
+        db.flush()
+        db.add(
+            audit_event(
+                user=user,
+                event_type="account.created",
+                action="account.create",
+                entity_type="account",
+                entity_id=account.id,
+                summary={"name": name, "kind": kind, "currency": currency},
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        return _manual_page(
+            request,
+            db,
+            user,
+            name="accounts.html",
+            section="accounts",
+            status_code=422,
+            error=str(exc),
+            account_values=values,
+        )
+    return RedirectResponse("/accounts", status_code=303)
+
+
+@router.post("/assets", dependencies=[Depends(require_csrf)])
+async def create_asset(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    form = await request.form()
+    values = _form_values(form)
+    try:
+        raw_code, raw_name = form.get("code"), form.get("name")
+        code = required_text(
+            raw_code.strip() if isinstance(raw_code, str) else raw_code,
+            "基金代码",
+            maximum=64,
+        )
+        name = required_text(
+            raw_name.strip() if isinstance(raw_name, str) else raw_name, "基金名称"
+        )
+        risk = required_text(form.get("risk_level"), "风险等级", maximum=16)
+        role = required_text(form.get("portfolio_role"), "组合角色", maximum=16)
+        if risk not in {"low", "medium", "high"}:
+            raise FormError("请选择有效的风险等级。")
+        if role not in {"core", "satellite"}:
+            raise FormError("请选择有效的组合角色。")
+        asset = Asset(
+            code=code,
+            market="CN",
+            name=name,
+            asset_class="fund",
+            risk_level=risk,
+            portfolio_role=role,
+            currency="CNY",
+        )
+        db.add(asset)
+        db.flush()
+        db.add(
+            audit_event(
+                user=user,
+                event_type="asset.created",
+                action="asset.create",
+                entity_type="asset",
+                entity_id=asset.id,
+                summary={"code": code, "risk_level": risk, "portfolio_role": role},
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        message = "该基金代码已经存在。" if isinstance(exc, IntegrityError) else str(exc)
+        return _manual_page(
+            request,
+            db,
+            user,
+            name="accounts.html",
+            section="accounts",
+            status_code=422,
+            error=message,
+            asset_values=values,
+        )
+    return RedirectResponse("/accounts", status_code=303)
+
+
+@router.post("/transactions", dependencies=[Depends(require_csrf)])
+async def create_transaction(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    form = await request.form()
+    values = _form_values(form)
+    try:
+        kind = required_text(form.get("kind"), "交易类型", maximum=20).upper()
+        account_id = parse_id(form.get("account_id"), "账户")
+        asset_id = parse_id(form.get("asset_id"), "资产", optional=True)
+        if account_id is None:
+            raise FormError("请选择有效的账户。")
+        amount_cents = parse_yuan(form.get("amount"), "金额", positive=True)
+        fee_cents = parse_yuan(form.get("fee"), "手续费")
+        if kind in {"BUY", "SELL"}:
+            quantity = parse_decimal(form.get("quantity"), "份额", positive=True)
+            raw_price = form.get("price")
+            price = (
+                parse_decimal(raw_price, "成交价格", positive=True)
+                if raw_price != ""
+                else None
+            )
+        else:
+            quantity, price = Decimal(0), None
+        occurred_at = parse_local_datetime(form.get("occurred_at"))
+        raw_note = form.get("note")
+        note = required_text(raw_note, "备注", maximum=1000) if raw_note else None
+        transaction = post_transaction(
+            db,
+            PostTransaction(
+                source="manual",
+                external_id=str(uuid4()),
+                kind=kind,
+                account_id=account_id,
+                asset_id=asset_id,
+                amount_cents=amount_cents,
+                quantity=quantity,
+                price=price,
+                fee_cents=fee_cents,
+                occurred_at=occurred_at,
+                note=note,
+            ),
+        )
+        db.add(
+            audit_event(
+                user=user,
+                event_type="transaction.created",
+                action="transaction.create",
+                entity_type="transaction",
+                entity_id=transaction.id,
+                summary={
+                    "kind": kind,
+                    "account_id": account_id,
+                    "asset_id": asset_id,
+                    "amount_cents": amount_cents,
+                },
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        return _manual_page(
+            request,
+            db,
+            user,
+            name="transaction_form.html",
+            section="transactions",
+            status_code=422,
+            error=str(exc),
+            values=values,
+        )
+    return RedirectResponse("/transactions", status_code=303)
+
+
+@router.post(
+    "/transactions/{transaction_id}/reversal", dependencies=[Depends(require_csrf)]
+)
+async def reverse_manual_transaction(
+    transaction_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    form = await request.form()
+    try:
+        reason = required_text(form.get("reason"), "冲正原因", maximum=500)
+        reversal = reverse_transaction(
+            db,
+            transaction_id,
+            reason,
+            source="manual-reversal",
+            external_id=str(uuid4()),
+        )
+        db.add(
+            audit_event(
+                user=user,
+                event_type="transaction.reversal_requested",
+                action="transaction.reverse",
+                entity_type="transaction",
+                entity_id=reversal.id,
+                summary={"original_transaction_id": transaction_id},
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        if db.get(Transaction, transaction_id) is None:
+            raise HTTPException(status_code=404, detail="Transaction not found") from exc
+        return _transactions_page(
+            request, db, user, status_code=422, error=str(exc)
+        )
+    return RedirectResponse("/transactions", status_code=303)
+
+
+@router.post("/prices", dependencies=[Depends(require_csrf)])
+async def create_price(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    form = await request.form()
+    values = _form_values(form)
+    try:
+        asset_id = parse_id(form.get("asset_id"), "资产")
+        if asset_id is None or db.get(Asset, asset_id) is None:
+            raise FormError("所选资产不存在。")
+        valuation_date = parse_date(form.get("valuation_date"), "估值日期")
+        if valuation_date > utc_now().astimezone(SHANGHAI).date():
+            raise FormError("估值日期不能晚于今天。")
+        price = parse_decimal(form.get("price"), "价格", positive=True)
+        source = manual_source(form.get("source", ""))
+        existing = db.scalar(
+            select(PriceSnapshot).where(
+                PriceSnapshot.asset_id == asset_id,
+                PriceSnapshot.valuation_date == valuation_date,
+                PriceSnapshot.source == source,
+            )
+        )
+        if existing is not None:
+            if existing.price != price:
+                raise FormError("同一资产、日期和来源已经记录了不同价格。")
+            return RedirectResponse("/prices/new", status_code=303)
+        snapshot = PriceSnapshot(
+            asset_id=asset_id,
+            valuation_date=valuation_date,
+            source=source,
+            price=price,
+            fetched_at=utc_now(),
+        )
+        db.add(snapshot)
+        db.flush()
+        db.add(
+            audit_event(
+                user=user,
+                event_type="price.created",
+                action="price.create",
+                entity_type="price_snapshot",
+                entity_id=snapshot.id,
+                summary={
+                    "asset_id": asset_id,
+                    "valuation_date": valuation_date.isoformat(),
+                    "source": source,
+                },
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        return _manual_page(
+            request,
+            db,
+            user,
+            name="price_form.html",
+            section="prices",
+            status_code=422,
+            error=str(exc),
+            values=values,
+        )
+    return RedirectResponse("/prices/new", status_code=303)
+
+
+@router.post("/prices/{price_id}", dependencies=[Depends(require_csrf)])
+async def update_price(
+    price_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    snapshot = db.get(PriceSnapshot, price_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Price not found")
+    if not snapshot.source.startswith("manual:"):
+        raise HTTPException(status_code=403, detail="Only manual prices can be edited")
+    form = await request.form()
+    values = _form_values(form)
+    try:
+        asset_id = parse_id(form.get("asset_id"), "资产")
+        if asset_id is None or db.get(Asset, asset_id) is None:
+            raise FormError("所选资产不存在。")
+        valuation_date = parse_date(form.get("valuation_date"), "估值日期")
+        if valuation_date > utc_now().astimezone(SHANGHAI).date():
+            raise FormError("估值日期不能晚于今天。")
+        price = parse_decimal(form.get("price"), "价格", positive=True)
+        source = manual_source(form.get("source", ""))
+        duplicate = db.scalar(
+            select(PriceSnapshot).where(
+                PriceSnapshot.asset_id == asset_id,
+                PriceSnapshot.valuation_date == valuation_date,
+                PriceSnapshot.source == source,
+                PriceSnapshot.id != snapshot.id,
+            )
+        )
+        if duplicate is not None:
+            raise FormError("修改后的资产、日期和来源已存在另一条记录。")
+        old = {
+            "asset_id": snapshot.asset_id,
+            "valuation_date": snapshot.valuation_date.isoformat(),
+            "price": format(snapshot.price, "f"),
+            "source": snapshot.source,
+        }
+        snapshot.asset_id = asset_id
+        snapshot.valuation_date = valuation_date
+        snapshot.price = price
+        snapshot.source = source
+        snapshot.fetched_at = utc_now()
+        db.add(
+            audit_event(
+                user=user,
+                event_type="price.updated",
+                action="price.update",
+                entity_type="price_snapshot",
+                entity_id=snapshot.id,
+                summary={
+                    "old": old,
+                    "new": {
+                        "asset_id": asset_id,
+                        "valuation_date": valuation_date.isoformat(),
+                        "price": format(price, "f"),
+                        "source": source,
+                    },
+                },
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        return _manual_page(
+            request,
+            db,
+            user,
+            name="price_form.html",
+            section="prices",
+            status_code=422,
+            error=str(exc),
+            values=values,
+            editing_price_id=price_id,
+        )
+    return RedirectResponse("/prices/new", status_code=303)
+
+
+@router.post("/alerts/{alert_id}/read", dependencies=[Depends(require_csrf)])
+def mark_alert_read(
+    alert_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    alert = db.get(Alert, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    if alert.status == "open":
+        alert.status = "read"
+        db.add(
+            audit_event(
+                user=user,
+                event_type="alert.read",
+                action="alert.read",
+                entity_type="alert",
+                entity_id=alert.id,
+                summary={"previous_status": "open", "status": "read"},
+            )
+        )
+        db.commit()
+    return RedirectResponse("/alerts", status_code=303)
+
+
+@router.get("/preview", response_class=HTMLResponse, include_in_schema=False)
+def preview(request: Request):
+    settings = get_settings()
+    if not settings.demo_mode or settings.environment != "development":
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="dashboard.html",
+        context={"section": "dashboard", "demo": True, "vm": dashboard()},
+    )
