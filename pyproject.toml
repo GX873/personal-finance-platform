@@ -25,6 +25,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+market-analysis = [
+    "efinance==0.5.9",
+    "xalpha==0.12.4",
+]
 dev = [
     "pytest",
     "pytest-cov",

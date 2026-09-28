@@ -27,7 +27,8 @@ db_session = database_session_fixture
 def valid_form(client):
     return {
         "csrf_token": csrf(client, "/settings"),
-        "daily_schedule": "09:00",
+        "daily_schedule": "14:00",
+        "cn_holidays": "[]",
         "reserve_target": "1000.00",
         "core_target_percent": "70.00",
         "satellite_target_percent": "30.00",
@@ -100,7 +101,8 @@ def test_settings_save_non_secrets_with_csrf_prg_and_audit(client, db_session):
         row.key: row.value for row in db_session.scalars(select(AppSetting)).all()
     }
     assert values == {
-        "daily_schedule": "09:00",
+        "daily_schedule": "14:00",
+        "cn_holidays": "[]",
         "reserve_target_cents": "100000",
         "stale_threshold_hours": "36",
     }

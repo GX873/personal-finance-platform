@@ -126,12 +126,14 @@ class FundPriceService:
                 valuation_date=quote.valuation_date,
                 source=quote.source,
                 price=quote.value,
+                quote_type=quote.quote_type,
             )
             self._session.add(snapshot)
         snapshot.price = quote.value
         snapshot.source_url = quote.source_url
         snapshot.fetched_at = quote.fetched_at
         snapshot.error_text = None
+        snapshot.quote_type = quote.quote_type
         self._session.flush()
 
         return RefreshResult(

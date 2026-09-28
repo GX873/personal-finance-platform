@@ -10,17 +10,19 @@ from enum import StrEnum
 from getpass import getpass
 from typing import Any
 
-from sqlalchemy import inspect, select, update
+from sqlalchemy import func, inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from finance_app.auth.models import User
 from finance_app.auth.service import hash_password
+from finance_app.calendar import is_skipped_reminder_day, parse_holidays
 from finance_app.config import Settings, get_settings
 from finance_app.db import get_session_factory, utc_now
-from finance_app.ledger.budget import BucketKind
+from finance_app.ledger.budget import BucketKind, cycle_allocation, salary_cycle
 from finance_app.ledger.models import (
     Asset,
+    AuditEvent,
     CashBucket,
     Holding,
     MonthlyBudget,
@@ -29,6 +31,7 @@ from finance_app.ledger.models import (
     Transaction,
 )
 from finance_app.market.eastmoney import EastMoneyFundNavProvider
+from finance_app.market.efinance_adapter import EfinanceAdapter
 from finance_app.market.service import FundPriceService
 from finance_app.notifications.base import DeliveryStatus, Notification
 from finance_app.notifications.email import EmailNotifier
@@ -43,9 +46,17 @@ from finance_app.notifications.wechat import build_wechat_notifier
 from finance_app.ops.backup import create_backup, restore_check
 from finance_app.ops.export import ExportService
 from finance_app.portfolio.models import (
+    Alert,
     AllocationTarget,
+    OpportunityAlert,
     PortfolioSnapshot,
     PriceSnapshot,
+)
+from finance_app.portfolio.opportunities import (
+    OpportunityAction,
+    OpportunityCandidate,
+    evaluate_opportunity,
+    opportunity_already_emitted,
 )
 from finance_app.portfolio.rules import (
     SHANGHAI,
@@ -60,7 +71,7 @@ from finance_app.portfolio.rules import (
 from finance_app.portfolio.service import create_daily_snapshot
 
 DAILY_JOB_NAME = "daily-check"
-DEFAULT_SCHEDULE = "09:00"
+DEFAULT_SCHEDULE = "14:00"
 DEFAULT_STALE_HOURS = 36
 STALE_JOB_AFTER = timedelta(hours=1)
 _SCHEDULE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z", re.ASCII)
@@ -99,6 +110,9 @@ class DailyCheck:
     def run_scheduled(self) -> DailyCheckResult:
         now = self.clock()
         local = now.astimezone(SHANGHAI)
+        holidays = parse_holidays(self._setting("cn_holidays", "[]"))
+        if is_skipped_reminder_day(local.date(), holidays):
+            return DailyCheckResult.NOT_DUE
         configured = self._setting("daily_schedule", DEFAULT_SCHEDULE)
         if _SCHEDULE.fullmatch(configured) is None:
             raise ValueError("stored daily schedule is invalid")
@@ -187,9 +201,20 @@ class DailyCheck:
             freshness = self.validate_freshness(business_date)
             snapshot = self.create_snapshot(business_date, freshness)
             advice = self.evaluate_rules(snapshot, freshness)
+            opportunities = self.scan_opportunities(snapshot, freshness, business_date)
+            advice.extend(opportunities)
             if not self._renew_claim():
                 self.session.rollback()
                 return DailyCheckResult.ALREADY_RAN
+            opportunity_status = DeliveryStatus.SUCCESS
+            if opportunities:
+                opportunity_status = self.notify(
+                    Notification(
+                        title=f"{business_date.isoformat()} 基金机会提醒",
+                        body=self._opportunity_body(opportunities[0]),
+                    ),
+                    critical=True,
+                )
             status = self.notify(
                 self.build_digest(business_date, snapshot, freshness, advice)
             )
@@ -203,7 +228,10 @@ class DailyCheck:
                 )
                 if critical_status is DeliveryStatus.FAILED:
                     status = DeliveryStatus.FAILED
-            if status is DeliveryStatus.FAILED:
+            if (
+                status is DeliveryStatus.FAILED
+                or opportunity_status is DeliveryStatus.FAILED
+            ):
                 return (
                     DailyCheckResult.FAILED
                     if self._finish_claim("failed", "notification_delivery_failed")
@@ -270,9 +298,9 @@ class DailyCheck:
         return True
 
     def refresh_prices(self, business_date: date) -> list[Any]:
-        del business_date
         results: list[Any] = []
         provider = EastMoneyFundNavProvider(clock=self.clock)
+        history_provider = EfinanceAdapter(clock=self.clock)
         try:
             service = FundPriceService(self.session, provider, clock=self.clock)
             fund_codes = self.session.scalars(
@@ -282,9 +310,77 @@ class DailyCheck:
             )
             for code in fund_codes:
                 results.append(service.refresh(code))
+                self._backfill_history(code, business_date, history_provider)
             return results
         finally:
             provider.close()
+
+    def _backfill_history(
+        self,
+        fund_code: str,
+        business_date: date,
+        provider: EfinanceAdapter,
+    ) -> int:
+        asset = self.session.scalar(
+            select(Asset).where(
+                Asset.code == fund_code,
+                Asset.market == "CN",
+                Asset.asset_class == "fund",
+            )
+        )
+        if asset is None:
+            return 0
+        count = self.session.scalar(
+            select(func.count()).select_from(PriceSnapshot).where(
+                PriceSnapshot.asset_id == asset.id,
+                PriceSnapshot.quote_type == "official_nav",
+                PriceSnapshot.error_text.is_(None),
+            )
+        )
+        if count is not None and count >= 250:
+            return 0
+        try:
+            quotes = provider.fetch_history(fund_code, limit=500)
+        except Exception:  # noqa: BLE001 - optional provider failures degrade safely
+            self.session.add(
+                AuditEvent(
+                    event_type="market_history_refresh_failed",
+                    entity_type="asset",
+                    entity_id=asset.id,
+                    details_json=json.dumps(
+                        {"source": provider.source, "error_code": "history_unavailable"},
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+            return 0
+        inserted = 0
+        for quote in quotes:
+            if quote.valuation_date > business_date:
+                continue
+            existing = self.session.scalar(
+                select(PriceSnapshot.id).where(
+                    PriceSnapshot.asset_id == asset.id,
+                    PriceSnapshot.valuation_date == quote.valuation_date,
+                    PriceSnapshot.source == quote.source,
+                )
+            )
+            if existing is not None:
+                continue
+            self.session.add(
+                PriceSnapshot(
+                    asset_id=asset.id,
+                    valuation_date=quote.valuation_date,
+                    source=quote.source,
+                    price=quote.value,
+                    quote_type=quote.quote_type,
+                    source_url=quote.source_url,
+                    fetched_at=quote.fetched_at,
+                )
+            )
+            inserted += 1
+        self.session.flush()
+        return inserted
 
     def validate_freshness(self, business_date: date) -> dict[str, Any]:
         now = self._reference_time(business_date)
@@ -372,10 +468,11 @@ class DailyCheck:
         )
 
     def _monthly_investment_remaining(self, business_date: date) -> int | None:
+        cycle_start, cycle_end = salary_cycle(business_date)
         rows = list(
             self.session.scalars(
                 select(MonthlyBudget).where(
-                    MonthlyBudget.month == business_date.strftime("%Y-%m")
+                    MonthlyBudget.month == cycle_start.strftime("%Y-%m")
                 )
             )
         )
@@ -386,10 +483,14 @@ class DailyCheck:
             for amount in amounts.values()
         ):
             return None
-        month_start = datetime(
-            business_date.year, business_date.month, 1, tzinfo=SHANGHAI
+        month_start = datetime.combine(cycle_start, datetime.min.time(), SHANGHAI)
+        next_month = datetime.combine(
+            cycle_end + timedelta(days=1), datetime.min.time(), SHANGHAI
         )
-        next_month = (month_start + timedelta(days=32)).replace(day=1)
+        next_business_day = datetime.combine(
+            business_date + timedelta(days=1), datetime.min.time(), SHANGHAI
+        )
+        period_end = min(next_month, next_business_day)
         reversed_ids = set(
             self.session.scalars(
                 select(Transaction.reverses_transaction_id).where(
@@ -402,7 +503,7 @@ class DailyCheck:
                 Transaction.kind == "BUY",
                 Transaction.reverses_transaction_id.is_(None),
                 Transaction.occurred_at >= month_start,
-                Transaction.occurred_at < next_month,
+                Transaction.occurred_at < period_end,
             )
         )
         used = sum(
@@ -420,18 +521,47 @@ class DailyCheck:
             row.bucket_kind: row.balance_cents
             for row in self.session.scalars(select(CashBucket))
         }
+        reserve_target = int(self._setting("reserve_target_cents", "100000"))
+        reserve_cents = buckets.get(BucketKind.RESERVE.value)
+        cycle_start, _ = salary_cycle(business_date)
+        special_used = (
+            self.session.scalar(
+                select(OpportunityAlert.id).where(
+                    OpportunityAlert.cycle_start == cycle_start,
+                    OpportunityAlert.used_special_budget.is_(True),
+                )
+            )
+            is not None
+        )
+        allocation = (
+            cycle_allocation(
+                reserve_cents=reserve_cents,
+                reserve_target_cents=reserve_target,
+                normal_budget_cents=20000,
+                special_used=special_used,
+            )
+            if reserve_cents is not None
+            else None
+        )
         return RuleContext(
-            reserve_cents=buckets.get(BucketKind.RESERVE.value),
+            reserve_cents=reserve_cents,
             investment_cash_cents=buckets.get(BucketKind.INVESTMENT.value),
             prices_fresh=freshness["prices_fresh"],
             holdings_fresh=freshness["holdings_fresh"],
             cash_fresh=freshness["cash_fresh"],
-            required_reserve_cents=int(self._setting("reserve_target_cents", "100000")),
+            required_reserve_cents=reserve_target,
             month_budget_remaining_cents=self._monthly_investment_remaining(
                 business_date
             ),
             source=",".join(freshness["sources"]) or "confirmed-ledger",
             timestamp=freshness["as_of"],
+            special_opportunity_used=special_used,
+            special_opportunity_cents=(
+                allocation.special_opportunity_cents if allocation else 0
+            ),
+            reserve_replenishment_cents=(
+                allocation.reserve_replenishment_cents if allocation else 0
+            ),
         )
 
     def default_advice(
@@ -535,6 +665,216 @@ class DailyCheck:
                     )
                 )
         return advice
+
+    def scan_opportunities(
+        self,
+        snapshot: PortfolioSnapshot | None,
+        freshness: dict[str, Any],
+        business_date: date,
+        position_provider: EfinanceAdapter | None = None,
+    ) -> list[Advice]:
+        """Screen tracked, unheld funds; never invent missing overlap or history."""
+        if (
+            snapshot is None
+            or not snapshot.data_complete
+            or not all(
+                freshness.get(key) is True
+                for key in ("prices_fresh", "holdings_fresh", "cash_fresh")
+            )
+        ):
+            return []
+        context = self._rule_context(freshness, business_date)
+        available = min(
+            context.investment_cash_cents or 0,
+            context.month_budget_remaining_cents or 0,
+        )
+        if available <= 0 and not context.special_opportunity_used:
+            available = context.special_opportunity_cents
+        if available <= 0:
+            return []
+        held_ids = set(
+            self.session.scalars(select(Holding.asset_id).where(Holding.quantity > 0))
+        )
+        held_funds = list(
+            self.session.scalars(
+                select(Asset).where(
+                    Asset.id.in_(held_ids),
+                    Asset.market == "CN",
+                    Asset.asset_class == "fund",
+                )
+            )
+        )
+        position_provider = position_provider or EfinanceAdapter()
+        targets = {
+            row.name: row for row in self.session.scalars(select(AllocationTarget))
+        }
+        role_values = {PortfolioRole.CORE.value: 0, PortfolioRole.SATELLITE.value: 0}
+        try:
+            details = json.loads(snapshot.details_json or "{}")
+            for item in details.get("holdings", []):
+                asset = self.session.get(Asset, item.get("asset_id"))
+                if asset is not None and asset.portfolio_role in role_values:
+                    role_values[asset.portfolio_role] += max(0, int(item["value_cents"]))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return []
+        cycle_start, _ = salary_cycle(business_date)
+        found: list[Advice] = []
+        assets = self.session.scalars(
+            select(Asset).where(
+                Asset.market == "CN",
+                Asset.asset_class == "fund",
+                Asset.id.not_in(held_ids),
+            )
+        )
+        for asset in assets:
+            if opportunity_already_emitted(
+                self.session, code=asset.code, cycle_start=cycle_start
+            ):
+                continue
+            history = list(
+                self.session.scalars(
+                    select(PriceSnapshot)
+                    .where(
+                        PriceSnapshot.asset_id == asset.id,
+                        PriceSnapshot.quote_type == "official_nav",
+                        PriceSnapshot.error_text.is_(None),
+                        PriceSnapshot.valuation_date <= business_date,
+                    )
+                    .order_by(PriceSnapshot.valuation_date)
+                )
+            )
+            if not history:
+                continue
+            prices = [row.price for row in history]
+            latest = prices[-1]
+            role_target = targets.get(asset.portfolio_role)
+            target_bps = role_target.target_bps if role_target is not None else 0
+            current_bps = (
+                role_values[asset.portfolio_role] * 10000 // snapshot.invested_value_cents
+                if snapshot.invested_value_cents > 0
+                else 0
+            )
+            rank = sum(value <= latest for value in prices)
+            valuation_percentile = rank * 100 // len(prices)
+            base = prices[max(0, len(prices) - 21)]
+            recent_gain_bps = int((latest / base - 1) * 10000) if base else 0
+            peak = max(prices)
+            drawdown_bps = int((peak - latest) / peak * 10000) if peak else 0
+            overlap_bps = 0
+            if held_funds:
+                try:
+                    candidate_positions = position_provider.fetch_positions(asset.code)
+                    held_positions = [
+                        position_provider.fetch_positions(row.code) for row in held_funds
+                    ]
+                except Exception:  # noqa: BLE001 - optional provider is a hard boundary
+                    candidate_positions = {}
+                    held_positions = []
+                    self.session.add(
+                        AuditEvent(
+                            event_type="fund_overlap_refresh_failed",
+                            entity_type="asset",
+                            entity_id=asset.id,
+                            details_json=json.dumps(
+                                {
+                                    "source": position_provider.source,
+                                    "error_code": "positions_unavailable",
+                                },
+                                separators=(",", ":"),
+                            ),
+                        )
+                    )
+                if not candidate_positions or any(not item for item in held_positions):
+                    continue
+                overlap_bps = max(
+                    sum(
+                        min(weight, positions.get(code, 0))
+                        for code, weight in candidate_positions.items()
+                    )
+                    for positions in held_positions
+                )
+            decision = evaluate_opportunity(
+                OpportunityCandidate(
+                    code=asset.code,
+                    name=asset.name,
+                    allocation_gap_bps=max(0, target_bps - current_bps),
+                    overlap_bps=overlap_bps,
+                    valuation_percentile=valuation_percentile,
+                    recent_gain_bps=recent_gain_bps,
+                    drawdown_bps=drawdown_bps,
+                    history_days=len(history),
+                    data_fresh=nav_is_fresh(
+                        history[-1].valuation_date,
+                        history[-1].fetched_at,
+                        self.clock(),
+                        holidays=parse_holidays(self._setting("cn_holidays", "[]")),
+                    ),
+                    available_cents=available,
+                )
+            )
+            if decision.action is not OpportunityAction.BUY_IN_BATCHES:
+                continue
+            used_special = (context.investment_cash_cents or 0) < decision.amount_cents
+            self.session.add(
+                OpportunityAlert(
+                    code=asset.code,
+                    cycle_start=cycle_start,
+                    action=decision.action.value,
+                    amount_cents=decision.amount_cents,
+                    reason_code=decision.reason_code,
+                    data_as_of=history[-1].fetched_at,
+                    used_special_budget=used_special,
+                )
+            )
+            self.session.add(
+                Alert(
+                    alert_type="fund_opportunity",
+                    severity="notice",
+                    message=(
+                        f"{asset.name}（{asset.code}）符合分批买入条件，"
+                        f"建议上限 {self._yuan(decision.amount_cents)}；请人工确认。"
+                    ),
+                )
+            )
+            found.append(
+                Advice(
+                    action=AdviceAction.BUY_IN_BATCHES,
+                    amount_cents=decision.amount_cents,
+                    reason_code=decision.reason_code,
+                    trigger="组合存在配置缺口，历史估值未处于高位，且近期没有追高信号。",
+                    max_risk="基金仍可能继续下跌，投入本金可能发生损失。",
+                    stop_discipline="分批执行；数据转为陈旧或估值升至高位时停止买入。",
+                    source=history[-1].source,
+                    timestamp=history[-1].fetched_at,
+                    asset_id=asset.id,
+                    code=asset.code,
+                    name=asset.name,
+                    scope="opportunity",
+                )
+            )
+            break
+        return found
+
+    def _opportunity_body(self, advice: Advice) -> str:
+        amount = (
+            "未知" if advice.amount_cents is None else self._yuan(advice.amount_cents)
+        )
+        identity = advice.name or advice.code or "未命名基金"
+        if advice.code:
+            identity = f"{identity}（{advice.code}）"
+        return "\n".join(
+            (
+                f"对象：{identity}",
+                f"行动：{advice.action.value}",
+                f"金额上限：{amount}",
+                f"触发条件：{advice.trigger}",
+                f"最大风险：{advice.max_risk}",
+                f"执行纪律：{advice.stop_discipline}",
+                f"数据来源：{advice.source}",
+                f"数据时间：{advice.timestamp.astimezone(SHANGHAI).isoformat(timespec='minutes')}",
+                "条件式建议：不构成涨跌预测，不保证收益，不自动下单。",
+            )
+        )
 
     def build_digest(
         self,

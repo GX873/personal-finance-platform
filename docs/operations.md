@@ -255,3 +255,9 @@ nginx -t && systemctl reload nginx
 
 Use the existing restricted SSH entry point for recovery. Do not remove
 Tailscale state or relax public firewall rules while diagnosing the failure.
+
+## 基金提醒调度
+
+`finance-daily.timer` 每五分钟唤醒一次任务，应用按设置页中的北京时间判断是否到达提醒窗口。默认时间为 14:00；周六、周日及 `cn_holidays` 中配置的日期返回 `not-due`。工资和投资预算周期从每月 15 日开始，到次月 14 日结束。
+
+正式净值与盘中估算分开保存。行情适配器失败时任务降级为 `WAIT_FOR_DATA`，不得用旧估算值生成买入或卖出建议。特殊机会每个工资周期最多记录一次，且不能令储备金低于 900 元。

@@ -78,7 +78,7 @@ if [[ ! -e "$RELEASE_DIR" ]]; then
 fi
 python3 -m venv "$RELEASE_DIR/.venv"
 "$RELEASE_DIR/.venv/bin/python" -m pip install --upgrade pip
-"$RELEASE_DIR/.venv/bin/python" -m pip install "$RELEASE_DIR"
+"$RELEASE_DIR/.venv/bin/python" -m pip install "$RELEASE_DIR[market-analysis]"
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
 # The release is immutable application code; only state directories are writable.

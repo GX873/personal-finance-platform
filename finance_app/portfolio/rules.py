@@ -13,11 +13,13 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 class AdviceAction(StrEnum):
     BUY = "BUY"
+    BUY_IN_BATCHES = "BUY_IN_BATCHES"
     HOLD = "HOLD"
     REDUCE_IN_BATCHES = "REDUCE_IN_BATCHES"
     SELL = "SELL"
     WAIT = "WAIT"
     WAIT_FOR_DATA = "WAIT_FOR_DATA"
+    WATCH = "WATCH"
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,9 @@ class RuleContext:
     cash_fresh: bool = False
     required_reserve_cents: int = 100000
     month_budget_remaining_cents: int | None = None
+    special_opportunity_used: bool = False
+    special_opportunity_cents: int = 0
+    reserve_replenishment_cents: int = 0
     source: str = "confirmed-data"
     timestamp: datetime = field(default_factory=utc_now)
 
@@ -43,6 +48,8 @@ class RuleContext:
             self.investment_cash_cents,
             self.required_reserve_cents,
             self.month_budget_remaining_cents,
+            self.special_opportunity_cents,
+            self.reserve_replenishment_cents,
         ):
             if value is not None and (
                 type(value) is not int or not 0 <= value <= 2**63 - 1
@@ -50,6 +57,8 @@ class RuleContext:
                 raise ValueError("money must be nonnegative integer cents")
         if self.required_reserve_cents is None:
             raise ValueError("reserve requirement is required")
+        if type(self.special_opportunity_used) is not bool:
+            raise ValueError("special opportunity usage must be boolean")
         aware(self.timestamp)
         if not self.source.strip():
             raise ValueError("source is required")

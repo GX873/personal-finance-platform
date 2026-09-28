@@ -3,9 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Protocol
 
 MAX_NAV = Decimal(1000000)
+
+
+class QuoteType(StrEnum):
+    OFFICIAL_NAV = "official_nav"
+    INTRADAY_ESTIMATE = "intraday_estimate"
 
 
 def validate_storable_nav(value: Decimal) -> None:
@@ -30,6 +36,7 @@ class FundNavQuote:
     source_url: str
     fetched_at: datetime
     attempts: int = 1
+    quote_type: QuoteType = QuoteType.OFFICIAL_NAV
 
     def __post_init__(self) -> None:
         validate_storable_nav(self.value)
@@ -48,6 +55,7 @@ class FundNavQuote:
             raise ValueError("fetch time must be timezone-aware")
         if type(self.attempts) is not int or self.attempts < 1:
             raise ValueError("attempt count must be a positive integer")
+        QuoteType(self.quote_type)
 
 
 class MarketDataError(RuntimeError):

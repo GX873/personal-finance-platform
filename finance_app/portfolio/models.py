@@ -66,6 +66,9 @@ class PriceSnapshot(Base):
     valuation_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     price: Mapped[Decimal] = mapped_column(DECIMAL_24_8, nullable=False)
+    quote_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="official_nav", server_default="official_nav"
+    )
     source_url: Mapped[str | None] = mapped_column(Text)
     fetched_at: Mapped[datetime] = mapped_column(
         UtcDateTime(), default=utc_now, nullable=False
@@ -108,3 +111,26 @@ class Alert(Base):
         UtcDateTime(), default=utc_now, nullable=False
     )
     resolved_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+
+
+class OpportunityAlert(Base):
+    __tablename__ = "opportunity_alerts"
+    __table_args__ = (
+        UniqueConstraint(
+            "code", "cycle_start", name="uq_opportunity_alerts_code_cycle"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    cycle_start: Mapped[date] = mapped_column(Date, nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    data_as_of: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    used_special_budget: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UtcDateTime(), default=utc_now, nullable=False
+    )

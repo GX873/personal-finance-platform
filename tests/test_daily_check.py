@@ -23,7 +23,12 @@ from finance_app.notifications.models import (
     NotificationChannel,
     NotificationDelivery,
 )
-from finance_app.portfolio.models import AllocationTarget, PortfolioSnapshot
+from finance_app.portfolio.models import (
+    AllocationTarget,
+    OpportunityAlert,
+    PortfolioSnapshot,
+    PriceSnapshot,
+)
 from finance_app.portfolio.rules import Advice, AdviceAction
 from tests.test_database import db_session as database_session_fixture
 
@@ -612,7 +617,7 @@ def test_monthly_budget_remaining_deducts_buy_amount_and_fee(db_session):
                 amount_cents=6_000,
                 quantity=Decimal(1),
                 fee_cents=250,
-                occurred_at=datetime(2026, 9, 10, tzinfo=UTC),
+                occurred_at=datetime(2026, 9, 20, tzinfo=UTC),
             )
         ]
     )
@@ -676,7 +681,7 @@ def test_monthly_budget_remaining_stops_at_zero_when_exhausted(db_session):
                 amount_cents=6_000,
                 quantity=Decimal(1),
                 fee_cents=250,
-                occurred_at=datetime(2026, 9, 10, tzinfo=UTC),
+                occurred_at=datetime(2026, 9, 20, tzinfo=UTC),
             )
         ]
     )
@@ -783,25 +788,25 @@ def test_monthly_budget_uses_shanghai_month_boundaries(db_session):
         + [
             Transaction(
                 source="test",
-                external_id="shanghai-september",
-                kind="BUY",
-                account_id=account.id,
-                asset_id=asset.id,
-                amount_cents=3_000,
-                quantity=Decimal(1),
-                fee_cents=0,
-                occurred_at=datetime(2026, 8, 31, 16, 30, tzinfo=UTC),
-            ),
-            Transaction(
-                source="test",
-                external_id="shanghai-october",
+                external_id="before-cycle",
                 kind="BUY",
                 account_id=account.id,
                 asset_id=asset.id,
                 amount_cents=7_000,
                 quantity=Decimal(1),
                 fee_cents=0,
-                occurred_at=datetime(2026, 9, 30, 16, tzinfo=UTC),
+                occurred_at=datetime(2026, 9, 14, 15, 30, tzinfo=UTC),
+            ),
+            Transaction(
+                source="test",
+                external_id="cycle-start",
+                kind="BUY",
+                account_id=account.id,
+                asset_id=asset.id,
+                amount_cents=3_000,
+                quantity=Decimal(1),
+                fee_cents=0,
+                occurred_at=datetime(2026, 9, 14, 16, 30, tzinfo=UTC),
             ),
         ]
     )
@@ -910,6 +915,91 @@ def test_scheduled_outside_five_minute_window_changes_nothing(db_session):
 
     assert check.events == []
     assert db_session.scalar(select(JobRun)) is None
+
+
+@pytest.mark.parametrize("day", [date(2026, 9, 26), date(2026, 9, 27)])
+def test_scheduled_check_skips_weekends(db_session, day):
+    at_time = datetime(day.year, day.month, day.day, 6, 0, tzinfo=UTC)
+    check = RecordingDailyCheck(db_session, clock=lambda: at_time)
+    assert check.run_scheduled() is DailyCheckResult.NOT_DUE
+    assert check.events == []
+
+
+def test_scheduled_check_skips_configured_chinese_holiday(db_session):
+    db_session.add(AppSetting(key="cn_holidays", value='["2026-10-01"]'))
+    db_session.commit()
+    at_time = datetime(2026, 10, 1, 6, 0, tzinfo=UTC)
+    check = RecordingDailyCheck(db_session, clock=lambda: at_time)
+    assert check.run_scheduled() is DailyCheckResult.NOT_DUE
+    assert check.events == []
+
+
+def test_opportunity_scan_uses_special_budget_once_for_tracked_unheld_fund(db_session):
+    asset = Asset(
+        code="000001",
+        market="CN",
+        name="Candidate",
+        asset_class="fund",
+        portfolio_role=PortfolioRole.CORE,
+    )
+    db_session.add_all(
+        [
+            asset,
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(bucket_kind="investment", balance_cents=0, updated_at=NOW),
+            AllocationTarget(name="core", target_bps=7000),
+        ]
+        + [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+    )
+    db_session.flush()
+    start = date(2026, 1, 16)
+    for index in range(250):
+        value = "1.50" if index < 100 else "1.70" if index < 200 else "1.65"
+        db_session.add(
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=start + timedelta(days=index),
+                source="manual:history",
+                price=Decimal(value),
+                quote_type="official_nav",
+                fetched_at=NOW,
+            )
+        )
+    db_session.flush()
+    snapshot = PortfolioSnapshot(
+        snapshot_date=date(2026, 9, 23),
+        total_value_cents=100_000,
+        known_value_cents=100_000,
+        invested_value_cents=100_000,
+        cash_value_cents=0,
+        data_complete=True,
+        details_json='{"holdings":[]}',
+    )
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:history"],
+    }
+    check = DailyCheck(db_session, clock=lambda: NOW)
+
+    advice = check.scan_opportunities(snapshot, freshness, date(2026, 9, 23))
+    db_session.flush()
+
+    assert advice[0].action is AdviceAction.BUY_IN_BATCHES
+    assert advice[0].amount_cents == 10_000
+    record = db_session.scalar(select(OpportunityAlert))
+    assert record is not None and record.used_special_budget is True
+    assert check.scan_opportunities(snapshot, freshness, date(2026, 9, 23)) == []
 
 
 def test_scheduled_runs_inside_beijing_five_minute_window(db_session):
