@@ -24,7 +24,7 @@ def test_nginx_denies_private_state_paths() -> None:
 
 def test_operations_and_release_artifacts_exist_with_security_guidance() -> None:
     required = {
-        "README.md": ("HTTP sends credentials in cleartext", "TLS"),
+        "README.md": ("公网 HTTP", "TLS"),
         "docs/operations.md": (
             "restore-check",
             "rollback",
