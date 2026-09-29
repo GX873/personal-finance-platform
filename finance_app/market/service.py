@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -12,9 +12,14 @@ from sqlalchemy.orm import Session
 
 from finance_app.db import utc_now
 from finance_app.ledger.models import Asset, AuditEvent
-from finance_app.market.base import FundNavProvider, MarketDataError
+from finance_app.market.base import (
+    FundNavProvider,
+    MarketDataError,
+    QuoteType,
+)
 from finance_app.portfolio.models import PriceSnapshot
 from finance_app.portfolio.rules import nav_is_fresh
+from finance_app.portfolio.service import refresh_current_snapshot_after_price_update
 
 
 class RefreshStatus(StrEnum):
@@ -34,6 +39,14 @@ class RefreshResult:
     source_url: str
     fetched_at: datetime
     attempts: int
+    error_summary: str | None
+    provider_attempts: tuple[ProviderAttempt, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ProviderAttempt:
+    source: str
+    status: RefreshStatus
     error_summary: str | None
 
 
@@ -135,6 +148,10 @@ class FundPriceService:
         snapshot.error_text = None
         snapshot.quote_type = quote.quote_type
         self._session.flush()
+        if quote.quote_type == QuoteType.OFFICIAL_NAV:
+            refresh_current_snapshot_after_price_update(
+                self._session, now=reference
+            )
 
         return RefreshResult(
             status=RefreshStatus.SUCCESS if fresh else RefreshStatus.STALE,
@@ -148,6 +165,48 @@ class FundPriceService:
             attempts=quote.attempts,
             error_summary=None,
         )
+
+    def refresh_with_fallback(
+        self, fund_code: str, providers: list[FundNavProvider]
+    ) -> RefreshResult:
+        if not providers:
+            raise ValueError("at least one NAV provider is required")
+        attempts: list[ProviderAttempt] = []
+        last_result: RefreshResult | None = None
+        for provider in providers:
+            try:
+                result = FundPriceService(
+                    self._session, provider, clock=self._clock
+                ).refresh(fund_code)
+            except Exception as error:  # noqa: BLE001 - provider boundary
+                attempts.append(
+                    ProviderAttempt(
+                        provider.source,
+                        RefreshStatus.FAILED,
+                        str(error)[:240] or "provider failed",
+                    )
+                )
+                continue
+            attempt_error = result.error_summary if result.status is RefreshStatus.FAILED else None
+            attempts.append(ProviderAttempt(provider.source, result.status, attempt_error))
+            last_result = result
+            if result.status is not RefreshStatus.FAILED:
+                return replace(result, provider_attempts=tuple(attempts))
+        if last_result is None:
+            reference = self._clock()
+            last_result = RefreshResult(
+                status=RefreshStatus.FAILED,
+                is_fresh=False,
+                snapshot=None,
+                last_good_snapshot=None,
+                last_good_price=None,
+                source=providers[-1].source,
+                source_url=providers[-1].source_url,
+                fetched_at=reference,
+                attempts=len(attempts),
+                error_summary="all NAV providers failed",
+            )
+        return replace(last_result, provider_attempts=tuple(attempts))
 
     def _last_good(self, asset_id: int) -> PriceSnapshot | None:
         return self._session.scalar(

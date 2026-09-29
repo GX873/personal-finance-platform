@@ -4,7 +4,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from getpass import getpass
@@ -30,9 +30,10 @@ from finance_app.ledger.models import (
     RiskLevel,
     Transaction,
 )
+from finance_app.market.base import FundNavProvider
 from finance_app.market.eastmoney import EastMoneyFundNavProvider
 from finance_app.market.efinance_adapter import EfinanceAdapter
-from finance_app.market.service import FundPriceService
+from finance_app.market.service import FundPriceService, RefreshResult, RefreshStatus
 from finance_app.notifications.base import DeliveryStatus, Notification
 from finance_app.notifications.email import EmailNotifier
 from finance_app.notifications.models import (
@@ -303,17 +304,67 @@ class DailyCheck:
         history_provider = EfinanceAdapter(clock=self.clock)
         try:
             service = FundPriceService(self.session, provider, clock=self.clock)
+            providers: list[FundNavProvider] = [provider, history_provider]
             fund_codes = self.session.scalars(
                 select(Asset.code)
                 .where(Asset.market == "CN", Asset.asset_class == "fund")
                 .order_by(Asset.code)
             )
             for code in fund_codes:
-                results.append(service.refresh(code))
+                result = service.refresh_with_fallback(code, providers)
+                results.append(result)
+                if isinstance(result, RefreshResult) and result.status is RefreshStatus.FAILED:
+                    self._record_manual_nav_recovery(code, business_date, result)
                 self._backfill_history(code, business_date, history_provider)
             return results
         finally:
             provider.close()
+
+    def _record_manual_nav_recovery(
+        self, fund_code: str, business_date: date, result: RefreshResult
+    ) -> None:
+        asset = self.session.scalar(
+            select(Asset).where(
+                Asset.code == fund_code,
+                Asset.market == "CN",
+                Asset.asset_class == "fund",
+            )
+        )
+        if asset is None:
+            return
+        start = datetime.combine(business_date, datetime.min.time(), SHANGHAI).astimezone(
+            UTC
+        )
+        existing = self.session.scalar(
+            select(Alert).where(
+                Alert.alert_type == "price",
+                Alert.status == "open",
+                Alert.created_at >= start,
+                Alert.message.contains(f"{asset.code}"),
+            )
+        )
+        if existing is not None:
+            return
+        last_date = (
+            result.last_good_snapshot.valuation_date.isoformat()
+            if result.last_good_snapshot is not None
+            else "无"
+        )
+        sources = ", ".join(
+            f"{item.source}:失败" for item in result.provider_attempts
+        ) or "自动来源失败"
+        self.session.add(
+            Alert(
+                alert_type="price",
+                severity="warning",
+                message=(
+                    f"需要手工补录基金净值：{asset.name}（{asset.code}）。"
+                    f"最后有效净值日期：{last_date}；{sources}。"
+                    "未生成数值，请在净值页面核对后录入。"
+                ),
+            )
+        )
+        self.session.flush()
 
     def _backfill_history(
         self,

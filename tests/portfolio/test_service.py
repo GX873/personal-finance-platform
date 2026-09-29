@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from finance_app.db import Base, create_db_engine
 from finance_app.ledger.models import Account, Asset, Holding
+from finance_app.market.base import QuoteType
 from finance_app.portfolio.models import PriceSnapshot
 from finance_app.portfolio.service import (
     create_daily_snapshot,
@@ -102,6 +103,55 @@ def test_price_refresh_does_not_confirm_missing_cash_or_holdings():
         assert refreshed is row
         assert refreshed.total_value_cents is None
         assert not refreshed.data_complete
+
+
+def test_snapshot_prefers_manual_nav_and_ignores_intraday_estimate():
+    engine = create_db_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        account = Account(name="cash", kind="cash", opening_balance_cents=1000)
+        asset = Asset(code="4", market="CN", name="fund")
+        session.add_all([account, asset])
+        session.flush()
+        session.add(Holding(account_id=account.id, asset_id=asset.id, quantity=Decimal(10)))
+        session.add_all(
+            [
+                PriceSnapshot(
+                    asset_id=asset.id,
+                    valuation_date=NOW.date(),
+                    price=Decimal("1.1"),
+                    source="eastmoney",
+                    fetched_at=NOW - timedelta(minutes=2),
+                    quote_type=QuoteType.OFFICIAL_NAV,
+                ),
+                PriceSnapshot(
+                    asset_id=asset.id,
+                    valuation_date=NOW.date(),
+                    price=Decimal("9.9"),
+                    source="efinance:estimate",
+                    fetched_at=NOW - timedelta(minutes=1),
+                    quote_type=QuoteType.INTRADAY_ESTIMATE,
+                ),
+                PriceSnapshot(
+                    asset_id=asset.id,
+                    valuation_date=NOW.date(),
+                    price=Decimal("1.2"),
+                    source="manual:user-entry",
+                    fetched_at=NOW - timedelta(minutes=3),
+                    quote_type=QuoteType.OFFICIAL_NAV,
+                ),
+            ]
+        )
+        session.flush()
+
+        row = create_daily_snapshot(
+            session, now=NOW, holdings_confirmed_at=NOW, cash_confirmed_at=NOW
+        )
+
+        assert row.total_value_cents == 2200
+        assert json.loads(row.details_json or "{}")["holdings"][0]["source"] == (
+            "manual:user-entry"
+        )
 
 
 def test_stale_and_future_price_do_not_become_complete():

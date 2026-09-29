@@ -16,6 +16,7 @@ from finance_app.ledger.models import (
     PortfolioRole,
     Transaction,
 )
+from finance_app.market.service import ProviderAttempt, RefreshResult, RefreshStatus
 from finance_app.notifications.base import DeliveryResult, DeliveryStatus, Notification
 from finance_app.notifications.models import (
     AppSetting,
@@ -24,6 +25,7 @@ from finance_app.notifications.models import (
     NotificationDelivery,
 )
 from finance_app.portfolio.models import (
+    Alert,
     AllocationTarget,
     OpportunityAlert,
     PortfolioSnapshot,
@@ -157,7 +159,7 @@ def test_refresh_prices_closes_owned_provider_after_success(db_session, monkeypa
             assert session is db_session
             assert actual_provider is provider
 
-        def refresh(self, code):
+        def refresh_with_fallback(self, code, providers):
             return code
 
     monkeypatch.setattr(
@@ -193,7 +195,7 @@ def test_refresh_prices_closes_owned_provider_after_unexpected_error(
         def __init__(self, session, actual_provider, *, clock):
             pass
 
-        def refresh(self, code):
+        def refresh_with_fallback(self, code, providers):
             raise RuntimeError("unexpected refresh failure")
 
     monkeypatch.setattr(
@@ -205,6 +207,63 @@ def test_refresh_prices_closes_owned_provider_after_unexpected_error(
         DailyCheck(db_session, clock=lambda: NOW).refresh_prices(date(2026, 9, 23))
 
     assert provider.closed is True
+
+
+def test_failed_official_sources_create_one_manual_recovery_alert(
+    db_session, monkeypatch
+):
+    db_session.add(
+        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    )
+    db_session.flush()
+
+    class Provider:
+        closed = False
+        source = "eastmoney"
+        source_url = "https://example.test/eastmoney"
+
+        def close(self):
+            self.closed = True
+
+    provider = Provider()
+    failed = RefreshResult(
+        status=RefreshStatus.FAILED,
+        is_fresh=False,
+        snapshot=None,
+        last_good_snapshot=None,
+        last_good_price=None,
+        source="efinance",
+        source_url="https://example.test/efinance",
+        fetched_at=NOW,
+        attempts=1,
+        error_summary="all NAV providers failed",
+        provider_attempts=(
+            ProviderAttempt("eastmoney", RefreshStatus.FAILED, "timeout"),
+            ProviderAttempt("efinance", RefreshStatus.FAILED, "unavailable"),
+        ),
+    )
+
+    class Service:
+        def __init__(self, session, actual_provider, *, clock):
+            pass
+
+        def refresh_with_fallback(self, code, providers):
+            return failed
+
+    monkeypatch.setattr("finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: provider)
+    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
+    monkeypatch.setattr(DailyCheck, "_backfill_history", lambda *args: 0)
+
+    check = DailyCheck(db_session, clock=lambda: NOW)
+    check.refresh_prices(date(2026, 9, 23))
+    check.refresh_prices(date(2026, 9, 23))
+
+    alerts = list(db_session.scalars(select(Alert)))
+    assert len(alerts) == 1
+    assert "000001" in alerts[0].message
+    assert "手工补录" in alerts[0].message
+    assert "未生成数值" in alerts[0].message
+    assert "1.234" not in alerts[0].message
 
 
 def test_daily_check_orders_freshness_before_advice(db_session):

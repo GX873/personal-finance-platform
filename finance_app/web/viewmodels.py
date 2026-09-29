@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from finance_app.db import utc_now
@@ -109,6 +109,7 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
                     PriceSnapshot.valuation_date <= today,
                     PriceSnapshot.fetched_at <= now,
                     PriceSnapshot.error_text.is_(None),
+                    PriceSnapshot.quote_type == "official_nav",
                     PriceSnapshot.price > 0,
                     func.length(func.trim(PriceSnapshot.source)) > 0,
                     PriceSnapshot.valuation_date
@@ -116,6 +117,12 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
                 )
                 .order_by(
                     PriceSnapshot.valuation_date.desc(),
+                    case(
+                        (PriceSnapshot.source.like("manual%"), 0),
+                        (PriceSnapshot.source == "eastmoney", 1),
+                        (PriceSnapshot.source == "efinance", 2),
+                        else_=3,
+                    ),
                     PriceSnapshot.fetched_at.desc(),
                     PriceSnapshot.id.desc(),
                 )

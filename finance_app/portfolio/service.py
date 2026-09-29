@@ -26,6 +26,16 @@ def value_cents(quantity: Decimal, price: Decimal) -> int:
     return result
 
 
+def price_source_priority(source: str) -> int:
+    if source.startswith("manual"):
+        return 0
+    if source == "eastmoney":
+        return 1
+    if source == "efinance":
+        return 2
+    return 3
+
+
 def refresh_current_snapshot_after_price_update(
     session: Session,
     *,
@@ -127,13 +137,21 @@ def create_daily_snapshot(
                     PriceSnapshot.valuation_date <= business_date,
                     PriceSnapshot.fetched_at <= now,
                     PriceSnapshot.error_text.is_(None),
+                    PriceSnapshot.quote_type == "official_nav",
                 )
                 .order_by(
                     PriceSnapshot.valuation_date.desc(),
-                    PriceSnapshot.fetched_at.desc(),
-                    PriceSnapshot.id.desc(),
                 )
             )
+        )
+        eligible.sort(
+            key=lambda row: (
+                row.valuation_date,
+                -price_source_priority(row.source),
+                row.fetched_at,
+                row.id,
+            ),
+            reverse=True,
         )
         price = next(
             (

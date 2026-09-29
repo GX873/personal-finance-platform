@@ -10,11 +10,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from finance_app.db import Base, create_db_engine
-from finance_app.ledger.models import Asset, AuditEvent
+from finance_app.ledger.models import Account, Asset, AuditEvent, Holding
 from finance_app.market.base import FundNavQuote, MarketDataError
 from finance_app.market.eastmoney import EastMoneyFundNavProvider
 from finance_app.market.service import FundPriceService, RefreshStatus
-from finance_app.portfolio.models import PriceSnapshot
+from finance_app.portfolio.models import PortfolioSnapshot, PriceSnapshot
+from finance_app.portfolio.service import create_daily_snapshot
 
 NOW = datetime(2026, 9, 23, 0, tzinfo=UTC)  # 08:00 in Asia/Shanghai
 SOURCE_URL = (
@@ -38,6 +39,11 @@ class StubProvider:
             raise self.error
         assert self.quote is not None
         return self.quote
+
+
+class EfinanceStubProvider(StubProvider):
+    source = "efinance"
+    source_url = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetList"
 
 
 def quote(
@@ -208,6 +214,81 @@ def test_refresh_is_idempotent_for_same_source_and_valuation_date():
 
         assert first.snapshot is second.snapshot
         assert session.scalar(select(func.count()).select_from(PriceSnapshot)) == 1
+    finally:
+        session.close()
+
+
+def test_refresh_with_fallback_uses_efinance_after_primary_failure():
+    session, _ = setup_session()
+    try:
+        primary_error = MarketDataError(
+            code="upstream_timeout",
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            fetched_at=NOW,
+            attempts=3,
+            summary="eastmoney unavailable",
+        )
+        primary = StubProvider(error=primary_error)
+        fallback = EfinanceStubProvider(
+            quote=FundNavQuote(
+                value=Decimal("1.25"),
+                valuation_date=date(2026, 9, 22),
+                source="efinance",
+                source_url=EfinanceStubProvider.source_url,
+                fetched_at=NOW,
+            )
+        )
+
+        result = FundPriceService(
+            session, primary, clock=lambda: NOW
+        ).refresh_with_fallback("000001", [primary, fallback])
+
+        assert result.status is RefreshStatus.SUCCESS
+        assert result.snapshot is not None
+        assert result.snapshot.source == "efinance"
+        assert primary.calls == ["000001"]
+        assert fallback.calls == ["000001"]
+        assert [item.source for item in result.provider_attempts] == [
+            "eastmoney",
+            "efinance",
+        ]
+        assert result.provider_attempts[0].error_summary == "eastmoney unavailable"
+    finally:
+        session.close()
+
+
+def test_official_refresh_revalues_existing_current_snapshot():
+    session, asset = setup_session()
+    try:
+        account = Account(name="cash", kind="cash", opening_balance_cents=1000)
+        session.add(account)
+        session.flush()
+        session.add(
+            Holding(
+                account_id=account.id,
+                asset_id=asset.id,
+                quantity=Decimal(10),
+                cost_cents=1000,
+            )
+        )
+        create_daily_snapshot(
+            session, now=NOW, holdings_confirmed_at=NOW, cash_confirmed_at=NOW
+        )
+        session.flush()
+        assert session.scalar(select(PortfolioSnapshot)).total_value_cents is None
+
+        result = FundPriceService(
+            session,
+            StubProvider(quote(valuation_date=NOW.date())),
+            clock=lambda: NOW,
+        ).refresh("000001")
+
+        assert result.status is RefreshStatus.SUCCESS
+        snapshot = session.scalar(select(PortfolioSnapshot))
+        assert snapshot is not None
+        assert snapshot.total_value_cents == 2235
+        assert snapshot.data_complete is True
     finally:
         session.close()
 
