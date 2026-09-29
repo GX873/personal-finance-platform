@@ -27,13 +27,23 @@ def value_cents(quantity: Decimal, price: Decimal) -> int:
 
 
 def price_source_priority(source: str) -> int:
-    if source.startswith("manual"):
+    if source == "manual" or source.startswith("manual:"):
         return 0
     if source == "eastmoney":
         return 1
     if source == "efinance":
         return 2
     return 3
+
+
+def price_selection_key(row: PriceSnapshot) -> tuple[date, int, datetime, int]:
+    """Sort newer NAVs first while honoring same-day source authority."""
+    return (
+        row.valuation_date,
+        -price_source_priority(row.source),
+        row.fetched_at,
+        row.id,
+    )
 
 
 def refresh_current_snapshot_after_price_update(
@@ -145,12 +155,7 @@ def create_daily_snapshot(
             )
         )
         eligible.sort(
-            key=lambda row: (
-                row.valuation_date,
-                -price_source_priority(row.source),
-                row.fetched_at,
-                row.id,
-            ),
+            key=price_selection_key,
             reverse=True,
         )
         price = next(

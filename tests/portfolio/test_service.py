@@ -11,11 +11,18 @@ from finance_app.market.base import QuoteType
 from finance_app.portfolio.models import PriceSnapshot
 from finance_app.portfolio.service import (
     create_daily_snapshot,
+    price_source_priority,
     refresh_current_snapshot_after_price_update,
     value_cents,
 )
 
 NOW = datetime(2026, 9, 23, 14, tzinfo=UTC)
+
+
+def test_only_manual_namespace_gets_manual_source_priority():
+    assert price_source_priority("manual") == 0
+    assert price_source_priority("manual:user-entry") == 0
+    assert price_source_priority("manually-imported") == 3
 
 
 def test_exact_cent_rounding_independent_of_context():

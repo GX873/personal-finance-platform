@@ -4,7 +4,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from getpass import getpass
@@ -69,7 +69,7 @@ from finance_app.portfolio.rules import (
     evaluate_reserve_shortfall,
     nav_is_fresh,
 )
-from finance_app.portfolio.service import create_daily_snapshot
+from finance_app.portfolio.service import create_daily_snapshot, price_selection_key
 
 DAILY_JOB_NAME = "daily-check"
 DEFAULT_SCHEDULE = "14:00"
@@ -332,15 +332,13 @@ class DailyCheck:
         )
         if asset is None:
             return
-        start = datetime.combine(business_date, datetime.min.time(), SHANGHAI).astimezone(
-            UTC
-        )
+        asset_marker = f"（{asset.code}）"
+        date_marker = f"业务日期：{business_date.isoformat()}；"
         existing = self.session.scalar(
             select(Alert).where(
                 Alert.alert_type == "price",
-                Alert.status == "open",
-                Alert.created_at >= start,
-                Alert.message.contains(f"{asset.code}"),
+                Alert.message.contains(asset_marker),
+                Alert.message.contains(date_marker),
             )
         )
         if existing is not None:
@@ -351,14 +349,16 @@ class DailyCheck:
             else "无"
         )
         sources = ", ".join(
-            f"{item.source}:失败" for item in result.provider_attempts
+            f"{item.source}:{'过期' if item.status is RefreshStatus.STALE else '失败'}"
+            for item in result.provider_attempts
         ) or "自动来源失败"
         self.session.add(
             Alert(
                 alert_type="price",
                 severity="warning",
                 message=(
-                    f"需要手工补录基金净值：{asset.name}（{asset.code}）。"
+                    f"需要手工补录基金净值：{asset.name}{asset_marker}。"
+                    f"{date_marker}"
                     f"最后有效净值日期：{last_date}；{sources}。"
                     "未生成数值，请在净值页面核对后录入。"
                 ),
@@ -445,21 +445,19 @@ class DailyCheck:
         price_rows: list[PriceSnapshot] = []
         prices_fresh = bool(holdings)
         for holding in holdings:
-            price = self.session.scalar(
+            eligible = list(
+                self.session.scalars(
                 select(PriceSnapshot)
                 .where(
                     PriceSnapshot.asset_id == holding.asset_id,
                     PriceSnapshot.valuation_date <= business_date,
                     PriceSnapshot.fetched_at <= now,
                     PriceSnapshot.error_text.is_(None),
+                    PriceSnapshot.quote_type == "official_nav",
                 )
-                .order_by(
-                    PriceSnapshot.valuation_date.desc(),
-                    PriceSnapshot.fetched_at.desc(),
-                    PriceSnapshot.id.desc(),
                 )
-                .limit(1)
             )
+            price = max(eligible, key=price_selection_key, default=None)
             if price is None:
                 prices_fresh = False
                 continue
@@ -794,6 +792,10 @@ class DailyCheck:
                     .order_by(PriceSnapshot.valuation_date)
                 )
             )
+            preferred_by_date: dict[date, PriceSnapshot] = {}
+            for row in sorted(history, key=price_selection_key, reverse=True):
+                preferred_by_date.setdefault(row.valuation_date, row)
+            history = [preferred_by_date[day] for day in sorted(preferred_by_date)]
             if not history:
                 continue
             prices = [row.price for row in history]

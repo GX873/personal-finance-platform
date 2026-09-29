@@ -19,7 +19,10 @@ from finance_app.market.base import (
 )
 from finance_app.portfolio.models import PriceSnapshot
 from finance_app.portfolio.rules import nav_is_fresh
-from finance_app.portfolio.service import refresh_current_snapshot_after_price_update
+from finance_app.portfolio.service import (
+    price_selection_key,
+    refresh_current_snapshot_after_price_update,
+)
 
 
 class RefreshStatus(StrEnum):
@@ -64,7 +67,12 @@ class FundPriceService:
         self._provider = provider
         self._clock = clock
 
-    def refresh(self, fund_code: str) -> RefreshResult:
+    def refresh(
+        self,
+        fund_code: str,
+        *,
+        required_quote_type: QuoteType | None = None,
+    ) -> RefreshResult:
         asset = self._session.scalar(
             select(Asset).where(
                 Asset.code == fund_code,
@@ -90,7 +98,21 @@ class FundPriceService:
         last_good = self._last_good(asset.id)
         try:
             quote = self._provider.fetch(fund_code)
-        except MarketDataError as error:
+        except Exception as error:  # noqa: BLE001 - provider fetch boundary
+            if isinstance(error, MarketDataError):
+                source = error.source
+                source_url = error.source_url
+                fetched_at = error.fetched_at
+                attempts = error.attempts
+                error_code = error.code
+                summary = error.summary
+            else:
+                source = self._provider.source
+                source_url = self._provider.source_url
+                fetched_at = self._clock()
+                attempts = 1
+                error_code = "provider_exception"
+                summary = str(error)[:240] or "provider failed"
             self._session.add(
                 AuditEvent(
                     event_type="market_price_refresh_failed",
@@ -98,12 +120,12 @@ class FundPriceService:
                     entity_id=asset.id,
                     details_json=json.dumps(
                         {
-                            "source": error.source,
-                            "source_url": error.source_url,
-                            "fetched_at": error.fetched_at.isoformat(),
-                            "attempts": error.attempts,
-                            "error_code": error.code,
-                            "error_text": error.summary,
+                            "source": source,
+                            "source_url": source_url,
+                            "fetched_at": fetched_at.isoformat(),
+                            "attempts": attempts,
+                            "error_code": error_code,
+                            "error_text": summary,
                         },
                         ensure_ascii=True,
                         separators=(",", ":"),
@@ -117,11 +139,49 @@ class FundPriceService:
                 snapshot=None,
                 last_good_snapshot=last_good,
                 last_good_price=last_good.price if last_good is not None else None,
-                source=error.source,
-                source_url=error.source_url,
-                fetched_at=error.fetched_at,
-                attempts=error.attempts,
-                error_summary=error.summary,
+                source=source,
+                source_url=source_url,
+                fetched_at=fetched_at,
+                attempts=attempts,
+                error_summary=summary,
+            )
+
+        if (
+            required_quote_type is not None
+            and QuoteType(quote.quote_type) is not required_quote_type
+        ):
+            summary = f"provider returned {quote.quote_type}; required {required_quote_type}"
+            self._session.add(
+                AuditEvent(
+                    event_type="market_price_refresh_failed",
+                    entity_type="asset",
+                    entity_id=asset.id,
+                    details_json=json.dumps(
+                        {
+                            "source": quote.source,
+                            "source_url": quote.source_url,
+                            "fetched_at": quote.fetched_at.isoformat(),
+                            "attempts": quote.attempts,
+                            "error_code": "unexpected_quote_type",
+                            "error_text": summary,
+                        },
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+            self._session.flush()
+            return RefreshResult(
+                status=RefreshStatus.FAILED,
+                is_fresh=False,
+                snapshot=None,
+                last_good_snapshot=last_good,
+                last_good_price=last_good.price if last_good is not None else None,
+                source=quote.source,
+                source_url=quote.source_url,
+                fetched_at=quote.fetched_at,
+                attempts=quote.attempts,
+                error_summary=summary,
             )
 
         reference = self._clock()
@@ -174,52 +234,68 @@ class FundPriceService:
         attempts: list[ProviderAttempt] = []
         last_result: RefreshResult | None = None
         for provider in providers:
-            try:
-                result = FundPriceService(
-                    self._session, provider, clock=self._clock
-                ).refresh(fund_code)
-            except Exception as error:  # noqa: BLE001 - provider boundary
-                attempts.append(
-                    ProviderAttempt(
-                        provider.source,
-                        RefreshStatus.FAILED,
-                        str(error)[:240] or "provider failed",
-                    )
-                )
-                continue
-            attempt_error = result.error_summary if result.status is RefreshStatus.FAILED else None
-            attempts.append(ProviderAttempt(provider.source, result.status, attempt_error))
+            result = FundPriceService(
+                self._session, provider, clock=self._clock
+            ).refresh(fund_code, required_quote_type=QuoteType.OFFICIAL_NAV)
+            official = (
+                result.snapshot is not None
+                and result.snapshot.quote_type == QuoteType.OFFICIAL_NAV
+            )
+            attempt_status = result.status
+            attempt_error = (
+                result.error_summary
+                if result.status is RefreshStatus.FAILED
+                else None
+            )
+            if result.snapshot is not None and not official:
+                attempt_status = RefreshStatus.FAILED
+                attempt_error = "provider returned a non-official NAV quote"
+            attempts.append(
+                ProviderAttempt(provider.source, attempt_status, attempt_error)
+            )
             last_result = result
-            if result.status is not RefreshStatus.FAILED:
+            if result.status is RefreshStatus.SUCCESS and official:
                 return replace(result, provider_attempts=tuple(attempts))
+        reference = self._clock()
+        asset = self._session.scalar(
+            select(Asset).where(
+                Asset.code == fund_code,
+                Asset.market == "CN",
+                Asset.asset_class == "fund",
+            )
+        )
+        last_good = self._last_good(asset.id) if asset is not None else None
         if last_result is None:
-            reference = self._clock()
             last_result = RefreshResult(
                 status=RefreshStatus.FAILED,
                 is_fresh=False,
                 snapshot=None,
-                last_good_snapshot=None,
-                last_good_price=None,
+                last_good_snapshot=last_good,
+                last_good_price=last_good.price if last_good is not None else None,
                 source=providers[-1].source,
                 source_url=providers[-1].source_url,
                 fetched_at=reference,
                 attempts=len(attempts),
-                error_summary="all NAV providers failed",
+                error_summary="no fresh official NAV from configured providers",
             )
-        return replace(last_result, provider_attempts=tuple(attempts))
+        return replace(
+            last_result,
+            status=RefreshStatus.FAILED,
+            is_fresh=False,
+            snapshot=None,
+            last_good_snapshot=last_good,
+            last_good_price=last_good.price if last_good is not None else None,
+            error_summary="no fresh official NAV from configured providers",
+            provider_attempts=tuple(attempts),
+        )
 
     def _last_good(self, asset_id: int) -> PriceSnapshot | None:
-        return self._session.scalar(
-            select(PriceSnapshot)
-            .where(
+        rows = self._session.scalars(
+            select(PriceSnapshot).where(
                 PriceSnapshot.asset_id == asset_id,
                 PriceSnapshot.error_text.is_(None),
                 PriceSnapshot.price > 0,
+                PriceSnapshot.quote_type == "official_nav",
             )
-            .order_by(
-                PriceSnapshot.valuation_date.desc(),
-                PriceSnapshot.fetched_at.desc(),
-                PriceSnapshot.id.desc(),
-            )
-            .limit(1)
         )
+        return max(rows, key=price_selection_key, default=None)

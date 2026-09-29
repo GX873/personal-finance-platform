@@ -244,3 +244,40 @@ def test_history_and_prices_use_bounded_queries(db_session):
         if "from portfolio_snapshots" in sql or "from price_snapshots" in sql
     ]
     assert bounded and all("limit" in sql for sql in bounded)
+
+
+def test_intraday_estimate_is_reference_only(db_session, monkeypatch):
+    from datetime import datetime
+    from decimal import Decimal
+
+    from finance_app.ledger.models import Account, Asset, Holding
+    from finance_app.portfolio.models import PriceSnapshot
+    from finance_app.web.viewmodels import dashboard
+
+    now = datetime(2026, 9, 23, 8, tzinfo=UTC)
+    monkeypatch.setattr("finance_app.web.viewmodels.utc_now", lambda: now)
+    account = Account(name="cash", kind="cash", currency="CNY")
+    asset = Asset(code="000001", market="CN", name="estimate fund")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add(
+        Holding(account_id=account.id, asset_id=asset.id, quantity=Decimal(10))
+    )
+    db_session.add(
+        PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=now.date(),
+            source="efinance:estimate",
+            price=Decimal("1.2"),
+            quote_type="intraday_estimate",
+            fetched_at=now,
+        )
+    )
+    db_session.commit()
+
+    data = dashboard(db_session)
+
+    assert data["holdings"][0]["nav"] == "1.2"
+    assert data["holdings"][0]["estimate"] is True
+    assert data["holdings"][0]["priced"] is False
+    assert data["priced_total"] == 0

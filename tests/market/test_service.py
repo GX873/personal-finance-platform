@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from finance_app.db import Base, create_db_engine
 from finance_app.ledger.models import Account, Asset, AuditEvent, Holding
-from finance_app.market.base import FundNavQuote, MarketDataError
+from finance_app.market.base import FundNavQuote, MarketDataError, QuoteType
 from finance_app.market.eastmoney import EastMoneyFundNavProvider
 from finance_app.market.service import FundPriceService, RefreshStatus
 from finance_app.portfolio.models import PortfolioSnapshot, PriceSnapshot
@@ -205,6 +205,40 @@ def test_provider_failure_does_not_overwrite_or_delete_last_good_price():
         session.close()
 
 
+def test_provider_failure_never_reports_intraday_estimate_as_last_good():
+    session, asset = setup_session()
+    try:
+        session.add(
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=NOW.date(),
+                price=Decimal("9.9"),
+                source="efinance:estimate",
+                source_url="https://example.test/estimate",
+                quote_type="intraday_estimate",
+                fetched_at=NOW,
+            )
+        )
+        session.flush()
+        error = MarketDataError(
+            code="upstream_timeout",
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            fetched_at=NOW,
+            attempts=3,
+            summary="official NAV unavailable",
+        )
+
+        result = FundPriceService(
+            session, StubProvider(error=error), clock=lambda: NOW
+        ).refresh("000001")
+
+        assert result.last_good_snapshot is None
+        assert result.last_good_price is None
+    finally:
+        session.close()
+
+
 def test_refresh_is_idempotent_for_same_source_and_valuation_date():
     session, _ = setup_session()
     try:
@@ -254,6 +288,241 @@ def test_refresh_with_fallback_uses_efinance_after_primary_failure():
             "efinance",
         ]
         assert result.provider_attempts[0].error_summary == "eastmoney unavailable"
+    finally:
+        session.close()
+
+
+def test_refresh_with_fallback_uses_fresh_fallback_after_stale_primary():
+    session, _ = setup_session()
+    try:
+        primary = StubProvider(quote(date(2026, 9, 19)))
+        fallback = EfinanceStubProvider(
+            quote=FundNavQuote(
+                value=Decimal("1.25"),
+                valuation_date=date(2026, 9, 22),
+                source="efinance",
+                source_url=EfinanceStubProvider.source_url,
+                fetched_at=NOW,
+            )
+        )
+
+        result = FundPriceService(
+            session, primary, clock=lambda: NOW
+        ).refresh_with_fallback("000001", [primary, fallback])
+
+        assert result.status is RefreshStatus.SUCCESS
+        assert result.snapshot is not None
+        assert result.snapshot.source == "efinance"
+        assert primary.calls == ["000001"]
+        assert fallback.calls == ["000001"]
+        assert [attempt.status for attempt in result.provider_attempts] == [
+            RefreshStatus.STALE,
+            RefreshStatus.SUCCESS,
+        ]
+    finally:
+        session.close()
+
+
+def test_refresh_with_fallback_reports_failure_when_all_official_navs_are_stale():
+    session, _ = setup_session()
+    try:
+        primary = StubProvider(quote(date(2026, 9, 18)))
+        fallback = EfinanceStubProvider(
+            quote=FundNavQuote(
+                value=Decimal("1.25"),
+                valuation_date=date(2026, 9, 19),
+                source="efinance",
+                source_url=EfinanceStubProvider.source_url,
+                fetched_at=NOW,
+            )
+        )
+
+        result = FundPriceService(
+            session, primary, clock=lambda: NOW
+        ).refresh_with_fallback("000001", [primary, fallback])
+
+        assert result.status is RefreshStatus.FAILED
+        assert result.is_fresh is False
+        assert result.last_good_snapshot is not None
+        assert result.last_good_snapshot.source == "efinance"
+        assert result.last_good_price == Decimal("1.25000000")
+        assert [attempt.status for attempt in result.provider_attempts] == [
+            RefreshStatus.STALE,
+            RefreshStatus.STALE,
+        ]
+    finally:
+        session.close()
+
+
+def test_refresh_with_fallback_does_not_accept_intraday_estimate_as_success():
+    session, asset = setup_session()
+    try:
+        existing_official = PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=date(2026, 9, 19),
+            price=Decimal("1.11"),
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            quote_type="official_nav",
+            fetched_at=NOW - timedelta(minutes=5),
+        )
+        session.add(existing_official)
+        session.flush()
+        primary = StubProvider(
+            FundNavQuote(
+                value=Decimal("1.24"),
+                valuation_date=date(2026, 9, 19),
+                source="eastmoney",
+                source_url=SOURCE_URL,
+                fetched_at=NOW,
+                quote_type=QuoteType.INTRADAY_ESTIMATE,
+            )
+        )
+        fallback = EfinanceStubProvider(
+            quote=FundNavQuote(
+                value=Decimal("1.25"),
+                valuation_date=date(2026, 9, 22),
+                source="efinance",
+                source_url=EfinanceStubProvider.source_url,
+                fetched_at=NOW,
+            )
+        )
+
+        result = FundPriceService(
+            session, primary, clock=lambda: NOW
+        ).refresh_with_fallback("000001", [primary, fallback])
+
+        assert result.status is RefreshStatus.SUCCESS
+        assert result.snapshot is not None
+        assert result.snapshot.source == "efinance"
+        assert fallback.calls == ["000001"]
+        assert result.provider_attempts[0].status is RefreshStatus.FAILED
+        session.refresh(existing_official)
+        assert existing_official.price == Decimal("1.11000000")
+        assert existing_official.quote_type == "official_nav"
+    finally:
+        session.close()
+
+
+def test_snapshot_recalculation_error_propagates_without_calling_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session, _ = setup_session()
+    try:
+        primary = StubProvider(quote())
+        fallback = EfinanceStubProvider(quote=quote())
+
+        def fail_recalculation(*args, **kwargs):
+            raise RuntimeError("snapshot recalculation failed")
+
+        monkeypatch.setattr(
+            "finance_app.market.service.refresh_current_snapshot_after_price_update",
+            fail_recalculation,
+        )
+
+        with pytest.raises(RuntimeError, match="snapshot recalculation failed"):
+            FundPriceService(
+                session, primary, clock=lambda: NOW
+            ).refresh_with_fallback("000001", [primary, fallback])
+
+        assert fallback.calls == []
+        assert session.in_transaction()
+    finally:
+        session.close()
+
+
+def test_refresh_with_fallback_preserves_last_official_nav_when_all_providers_raise():
+    session, asset = setup_session()
+    try:
+        official = PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=date(2026, 9, 19),
+            price=Decimal("1.20"),
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            quote_type="official_nav",
+            fetched_at=NOW,
+        )
+        session.add(official)
+        session.flush()
+        primary = StubProvider(error=RuntimeError("primary transport failed"))
+        fallback = EfinanceStubProvider(
+            error=RuntimeError("fallback response failed")
+        )
+
+        result = FundPriceService(
+            session, primary, clock=lambda: NOW
+        ).refresh_with_fallback("000001", [primary, fallback])
+
+        assert result.status is RefreshStatus.FAILED
+        assert result.last_good_snapshot is official
+        assert result.last_good_price == Decimal("1.20000000")
+        assert [attempt.source for attempt in result.provider_attempts] == [
+            "eastmoney",
+            "efinance",
+        ]
+        assert [attempt.error_summary for attempt in result.provider_attempts] == [
+            "primary transport failed",
+            "fallback response failed",
+        ]
+        audits = list(
+            session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.event_type == "market_price_refresh_failed")
+                .order_by(AuditEvent.id)
+            )
+        )
+        assert [json.loads(audit.details_json or "")["source"] for audit in audits] == [
+            "eastmoney",
+            "efinance",
+        ]
+        assert all(
+            json.loads(audit.details_json or "")["error_code"]
+            == "provider_exception"
+            for audit in audits
+        )
+    finally:
+        session.close()
+
+
+def test_last_good_prefers_manual_nav_over_newer_same_day_automatic_sources():
+    session, asset = setup_session()
+    try:
+        session.add_all(
+            [
+                PriceSnapshot(
+                    asset_id=asset.id,
+                    valuation_date=date(2026, 9, 22),
+                    price=Decimal("1.10"),
+                    source="eastmoney",
+                    fetched_at=NOW - timedelta(minutes=1),
+                ),
+                PriceSnapshot(
+                    asset_id=asset.id,
+                    valuation_date=date(2026, 9, 22),
+                    price=Decimal("1.20"),
+                    source="manual:user-entry",
+                    fetched_at=NOW - timedelta(minutes=5),
+                ),
+            ]
+        )
+        session.flush()
+        error = MarketDataError(
+            code="upstream_timeout",
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            fetched_at=NOW,
+            attempts=3,
+            summary="official NAV unavailable",
+        )
+
+        result = FundPriceService(
+            session, StubProvider(error=error), clock=lambda: NOW
+        ).refresh("000001")
+
+        assert result.last_good_snapshot is not None
+        assert result.last_good_snapshot.source == "manual:user-entry"
+        assert result.last_good_price == Decimal("1.20000000")
     finally:
         session.close()
 

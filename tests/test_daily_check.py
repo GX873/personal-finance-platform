@@ -12,6 +12,7 @@ from finance_app.ledger.models import (
     Account,
     Asset,
     CashBucket,
+    Holding,
     MonthlyBudget,
     PortfolioRole,
     Transaction,
@@ -31,6 +32,7 @@ from finance_app.portfolio.models import (
     PortfolioSnapshot,
     PriceSnapshot,
 )
+from finance_app.portfolio.opportunities import evaluate_opportunity
 from finance_app.portfolio.rules import Advice, AdviceAction
 from tests.test_database import db_session as database_session_fixture
 
@@ -266,6 +268,63 @@ def test_failed_official_sources_create_one_manual_recovery_alert(
     assert "1.234" not in alerts[0].message
 
 
+def test_manual_recovery_alert_is_idempotent_per_asset_and_business_date(
+    db_session, monkeypatch
+):
+    db_session.add(
+        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    )
+    db_session.flush()
+
+    class Provider:
+        source = "eastmoney"
+        source_url = "https://example.test/eastmoney"
+
+        def close(self):
+            pass
+
+    failed = RefreshResult(
+        status=RefreshStatus.FAILED,
+        is_fresh=False,
+        snapshot=None,
+        last_good_snapshot=None,
+        last_good_price=None,
+        source="efinance",
+        source_url="https://example.test/efinance",
+        fetched_at=NOW,
+        attempts=2,
+        error_summary="no fresh official NAV",
+        provider_attempts=(
+            ProviderAttempt("eastmoney", RefreshStatus.STALE, None),
+            ProviderAttempt("efinance", RefreshStatus.FAILED, "unavailable"),
+        ),
+    )
+
+    class Service:
+        def __init__(self, session, actual_provider, *, clock):
+            pass
+
+        def refresh_with_fallback(self, code, providers):
+            return failed
+
+    monkeypatch.setattr("finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: Provider())
+    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
+    monkeypatch.setattr(DailyCheck, "_backfill_history", lambda *args: 0)
+
+    check = DailyCheck(db_session, clock=lambda: NOW)
+    check.refresh_prices(date(2026, 9, 22))
+    check.refresh_prices(date(2026, 9, 22))
+    check.refresh_prices(date(2026, 9, 23))
+
+    alerts = list(db_session.scalars(select(Alert).order_by(Alert.id)))
+    assert len(alerts) == 2
+    assert "业务日期：2026-09-22" in alerts[0].message
+    assert "业务日期：2026-09-23" in alerts[1].message
+    assert [alert.alert_type for alert in alerts] == ["price", "price"]
+    assert "eastmoney:过期" in alerts[0].message
+    assert "efinance:失败" in alerts[0].message
+
+
 def test_daily_check_orders_freshness_before_advice(db_session):
     check = RecordingDailyCheck(db_session, clock=lambda: NOW)
 
@@ -419,6 +478,70 @@ def test_freshness_keeps_cash_and_holdings_confirmation_times_separate(db_sessio
     snapshot = check.create_snapshot(date(2026, 9, 23), freshness)
     assert '"cash_confirmed_at": "2026-09-22T23:00:00+00:00"' in snapshot.details_json
     assert '"holdings_confirmed_at": null' in snapshot.details_json
+
+
+def test_freshness_never_treats_intraday_estimate_as_official_nav(db_session):
+    account = Account(name="cash", kind="cash")
+    asset = Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add(
+        Holding(account_id=account.id, asset_id=asset.id, quantity=Decimal(1))
+    )
+    db_session.add(
+        PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=date(2026, 9, 23),
+            price=Decimal("1.2"),
+            source="efinance:estimate",
+            quote_type="intraday_estimate",
+            fetched_at=NOW,
+        )
+    )
+    db_session.flush()
+
+    freshness = DailyCheck(db_session, clock=lambda: NOW).validate_freshness(
+        date(2026, 9, 23)
+    )
+
+    assert freshness["prices_fresh"] is False
+    assert freshness["sources"] == []
+
+
+def test_freshness_prefers_manual_nav_over_newer_same_day_automatic_source(
+    db_session,
+):
+    account = Account(name="cash", kind="cash")
+    asset = Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add(Holding(account_id=account.id, asset_id=asset.id, quantity=Decimal(1)))
+    db_session.add_all(
+        [
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 9, 22),
+                price=Decimal("1.1"),
+                source="eastmoney",
+                fetched_at=NOW - timedelta(minutes=1),
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 9, 22),
+                price=Decimal("1.2"),
+                source="manual:user-entry",
+                fetched_at=NOW - timedelta(minutes=5),
+            ),
+        ]
+    )
+    db_session.flush()
+
+    freshness = DailyCheck(db_session, clock=lambda: NOW).validate_freshness(
+        date(2026, 9, 23)
+    )
+
+    assert freshness["sources"] == ["manual:user-entry"]
+    assert freshness["price_as_of"] == NOW - timedelta(minutes=5)
 
 
 def test_allocation_targets_trigger_satellite_reduction(db_session):
@@ -1059,6 +1182,97 @@ def test_opportunity_scan_uses_special_budget_once_for_tracked_unheld_fund(db_se
     record = db_session.scalar(select(OpportunityAlert))
     assert record is not None and record.used_special_budget is True
     assert check.scan_opportunities(snapshot, freshness, date(2026, 9, 23)) == []
+
+
+def test_opportunity_history_uses_one_priority_sample_per_valuation_date(
+    db_session, monkeypatch
+):
+    asset = Asset(
+        code="000002",
+        market="CN",
+        name="Corrected Candidate",
+        asset_class="fund",
+        portfolio_role=PortfolioRole.CORE,
+    )
+    db_session.add_all(
+        [
+            asset,
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=NOW),
+            AllocationTarget(name="core", target_bps=7000),
+            MonthlyBudget(month="2026-09", bucket_kind="investment", amount_cents=20_000),
+        ]
+    )
+    db_session.flush()
+    start = date(2026, 1, 16)
+    for index in range(249):
+        value = "1.50" if index < 100 else "1.70"
+        db_session.add(
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=start + timedelta(days=index),
+                source="efinance",
+                price=Decimal(value),
+                fetched_at=NOW - timedelta(days=1),
+            )
+        )
+    latest_date = start + timedelta(days=249)
+    db_session.add_all(
+        [
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=latest_date,
+                source="manual:user-entry",
+                price=Decimal("1.50"),
+                fetched_at=NOW - timedelta(minutes=3),
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=latest_date,
+                source="eastmoney",
+                price=Decimal("9.00"),
+                fetched_at=NOW - timedelta(minutes=1),
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=latest_date,
+                source="efinance",
+                price=Decimal("8.00"),
+                fetched_at=NOW - timedelta(minutes=2),
+            ),
+        ]
+    )
+    db_session.flush()
+    snapshot = PortfolioSnapshot(
+        snapshot_date=date(2026, 9, 23),
+        total_value_cents=100_000,
+        known_value_cents=100_000,
+        invested_value_cents=100_000,
+        cash_value_cents=0,
+        data_complete=True,
+        details_json='{"holdings":[]}',
+    )
+    freshness = {
+        "prices_fresh": True,
+        "holdings_fresh": True,
+        "cash_fresh": True,
+        "as_of": NOW,
+        "sources": ["manual:user-entry"],
+    }
+    candidates = []
+
+    def record_candidate(candidate):
+        candidates.append(candidate)
+        return evaluate_opportunity(candidate)
+
+    monkeypatch.setattr("finance_app.cli.evaluate_opportunity", record_candidate)
+
+    advice = DailyCheck(db_session, clock=lambda: NOW).scan_opportunities(
+        snapshot, freshness, date(2026, 9, 23)
+    )
+
+    assert candidates[0].history_days == 250
+    assert advice[0].source == "manual:user-entry"
 
 
 def test_scheduled_runs_inside_beijing_five_minute_window(db_session):
