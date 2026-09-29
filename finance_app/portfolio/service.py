@@ -26,6 +26,56 @@ def value_cents(quantity: Decimal, price: Decimal) -> int:
     return result
 
 
+def refresh_current_snapshot_after_price_update(
+    session: Session,
+    *,
+    now: datetime,
+    holidays: frozenset[date] = frozenset(),
+) -> PortfolioSnapshot | None:
+    """Revalue today's existing snapshot after a confirmed price edit.
+
+    A price edit must not silently confirm cash or holdings. Confirmation
+    timestamps are carried forward only when the existing snapshot recorded
+    them; missing or malformed timestamps remain unconfirmed.
+    """
+    aware(now)
+    business_date = now.astimezone(SHANGHAI).date()
+    row = session.scalar(
+        select(PortfolioSnapshot).where(
+            PortfolioSnapshot.snapshot_date == business_date
+        )
+    )
+    if row is None:
+        return None
+
+    details: dict[str, object] = {}
+    if row.details_json:
+        try:
+            parsed = json.loads(row.details_json)
+            if isinstance(parsed, dict):
+                details = parsed
+        except (TypeError, ValueError):
+            details = {}
+
+    def timestamp(key: str) -> datetime | None:
+        value = details.get(key)
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else None
+
+    return create_daily_snapshot(
+        session,
+        now=now,
+        holdings_confirmed_at=timestamp("holdings_confirmed_at"),
+        cash_confirmed_at=timestamp("cash_confirmed_at"),
+        holidays=holidays,
+    )
+
+
 def create_daily_snapshot(
     session: Session,
     *,

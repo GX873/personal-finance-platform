@@ -8,7 +8,11 @@ from sqlalchemy.orm import Session
 from finance_app.db import Base, create_db_engine
 from finance_app.ledger.models import Account, Asset, Holding
 from finance_app.portfolio.models import PriceSnapshot
-from finance_app.portfolio.service import create_daily_snapshot, value_cents
+from finance_app.portfolio.service import (
+    create_daily_snapshot,
+    refresh_current_snapshot_after_price_update,
+    value_cents,
+)
 
 NOW = datetime(2026, 9, 23, 14, tzinfo=UTC)
 
@@ -69,6 +73,35 @@ def test_snapshot_unknown_price_partial_then_fresh_and_idempotent():
         session.rollback()
     with Session(engine) as session:
         assert session.query(Account).count() == 0
+
+
+def test_price_refresh_does_not_confirm_missing_cash_or_holdings():
+    engine = create_db_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        account = Account(name="cash", kind="cash", opening_balance_cents=1000)
+        asset = Asset(code="3", market="CN", name="fund")
+        session.add_all([account, asset])
+        session.flush()
+        session.add(
+            Holding(account_id=account.id, asset_id=asset.id, quantity=Decimal(10))
+        )
+        session.add(
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=NOW.date(),
+                price=Decimal(1),
+                source="manual",
+                fetched_at=NOW,
+            )
+        )
+        session.flush()
+        row = create_daily_snapshot(session, now=NOW)
+        assert row.total_value_cents is None
+        refreshed = refresh_current_snapshot_after_price_update(session, now=NOW)
+        assert refreshed is row
+        assert refreshed.total_value_cents is None
+        assert not refreshed.data_complete
 
 
 def test_stale_and_future_price_do_not_become_complete():

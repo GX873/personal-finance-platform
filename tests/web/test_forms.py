@@ -17,8 +17,16 @@ from alembic import command
 from finance_app.app import create_app
 from finance_app.auth.models import User
 from finance_app.db import create_db_engine, get_session_factory, reset_database_state
-from finance_app.ledger.models import Account, Asset, AuditEvent, Transaction
-from finance_app.portfolio.models import Alert, PriceSnapshot
+from finance_app.ledger.models import (
+    Account,
+    Asset,
+    AuditEvent,
+    CashBucket,
+    Holding,
+    Transaction,
+)
+from finance_app.portfolio.models import Alert, PortfolioSnapshot, PriceSnapshot
+from finance_app.portfolio.service import create_daily_snapshot
 from finance_app.web import routes as web_routes
 from finance_app.web.forms import FormError, parse_decimal, parse_yuan
 
@@ -574,6 +582,63 @@ def test_manual_price_is_audited_idempotent_and_can_be_edited(client, db_session
     details = json.loads(updated_event.details_json)
     assert details["summary"]["old"]["price"] == "1.23456789"
     assert details["summary"]["new"]["price"] == "1.25"
+
+
+def test_editing_current_nav_refreshes_existing_portfolio_snapshot(
+    client, db_session, monkeypatch
+):
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 9, 23, 14, tzinfo=UTC)
+    monkeypatch.setattr(web_routes, "utc_now", lambda: now)
+    account = add_account(db_session, opening_balance_cents=1000)
+    asset = add_asset(db_session)
+    db_session.add(
+        Holding(
+            account_id=account.id,
+            asset_id=asset.id,
+            quantity=Decimal(10),
+            cost_cents=1000,
+        )
+    )
+    db_session.add(
+        CashBucket(bucket_kind="reserve", balance_cents=100000, updated_at=now)
+    )
+    db_session.add(
+        PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=now.date(),
+            price=Decimal(1),
+            source="manual:fund-statement",
+            fetched_at=now,
+        )
+    )
+    db_session.flush()
+    create_daily_snapshot(
+        db_session,
+        now=now,
+        holdings_confirmed_at=now,
+        cash_confirmed_at=now,
+    )
+    db_session.commit()
+
+    assert login(client).status_code == 303
+    response = client.post(
+        f"/prices/{db_session.scalar(select(PriceSnapshot)).id}",
+        data={
+            "csrf_token": csrf(client, "/prices/new"),
+            "asset_id": str(asset.id),
+            "valuation_date": now.date().isoformat(),
+            "price": "2",
+            "source": "fund-statement",
+        },
+    )
+    assert response.status_code == 303
+    db_session.expire_all()
+    refreshed = db_session.scalar(select(PortfolioSnapshot))
+    assert refreshed is not None
+    assert refreshed.data_complete is True
+    assert refreshed.total_value_cents == 3000
 
 
 @pytest.mark.parametrize(

@@ -40,6 +40,7 @@ from finance_app.portfolio.models import (
     PortfolioSnapshot,
     PriceSnapshot,
 )
+from finance_app.portfolio.service import refresh_current_snapshot_after_price_update
 from finance_app.web.forms import (
     SHANGHAI,
     FormError,
@@ -831,6 +832,7 @@ async def create_price(
         )
         db.add(snapshot)
         db.flush()
+        refresh_current_snapshot_after_price_update(db, now=utc_now())
         db.add(
             audit_event(
                 user=user,
@@ -905,6 +907,7 @@ async def update_price(
         snapshot.price = price
         snapshot.source = source
         snapshot.fetched_at = utc_now()
+        refresh_current_snapshot_after_price_update(db, now=snapshot.fetched_at)
         db.add(
             audit_event(
                 user=user,
