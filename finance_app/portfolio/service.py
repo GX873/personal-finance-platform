@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from finance_app.ledger.models import Account, Asset, Holding, Transaction
 from finance_app.ledger.service import account_cash_balance
 from finance_app.portfolio.models import PortfolioSnapshot, PriceSnapshot
-from finance_app.portfolio.rules import SHANGHAI, aware, expected_nav_date, nav_is_fresh
+from finance_app.portfolio.rules import SHANGHAI, aware
 
 
 def value_cents(quantity: Decimal, price: Decimal) -> int:
@@ -105,7 +105,6 @@ def create_daily_snapshot(
     holidays: frozenset[date] = frozenset(),
 ) -> PortfolioSnapshot:
     aware(now)
-    expected = expected_nav_date(now, holidays)
     business_date = now.astimezone(SHANGHAI).date()
 
     def confirmed(timestamp: datetime | None) -> bool:
@@ -114,7 +113,7 @@ def create_daily_snapshot(
         aware(timestamp)
         if timestamp > now:
             raise ValueError("confirmation cannot be in the future")
-        return timestamp.astimezone(SHANGHAI).date() >= expected
+        return True
 
     holdings_fresh = confirmed(holdings_confirmed_at)
     cash_fresh = confirmed(cash_confirmed_at)
@@ -178,13 +177,7 @@ def create_daily_snapshot(
         amount = (
             value_cents(holding.quantity, price.price) if price and supported else None
         )
-        fresh = (
-            price is not None
-            and supported
-            and nav_is_fresh(
-                price.valuation_date, price.fetched_at, now, holidays=holidays
-            )
-        )
+        fresh = price is not None and supported
         complete = complete and fresh
         if amount is not None:
             invested += amount

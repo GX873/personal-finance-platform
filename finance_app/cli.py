@@ -73,7 +73,6 @@ from finance_app.portfolio.service import create_daily_snapshot, price_selection
 
 DAILY_JOB_NAME = "daily-check"
 DEFAULT_SCHEDULE = "14:00"
-DEFAULT_STALE_HOURS = 36
 STALE_JOB_AFTER = timedelta(hours=1)
 _SCHEDULE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z", re.ASCII)
 
@@ -435,15 +434,11 @@ class DailyCheck:
 
     def validate_freshness(self, business_date: date) -> dict[str, Any]:
         now = self._reference_time(business_date)
-        threshold = int(
-            self._setting("stale_threshold_hours", str(DEFAULT_STALE_HOURS))
-        )
-        cutoff = now - timedelta(hours=threshold)
         holdings = list(
             self.session.scalars(select(Holding).where(Holding.quantity > 0))
         )
         price_rows: list[PriceSnapshot] = []
-        prices_fresh = bool(holdings)
+        prices_fresh = True
         for holding in holdings:
             eligible = list(
                 self.session.scalars(
@@ -466,19 +461,13 @@ class DailyCheck:
             )
             if valid_price:
                 price_rows.append(price)
-            if (
-                not valid_price
-                or price.fetched_at < cutoff
-                or not nav_is_fresh(price.valuation_date, price.fetched_at, now)
-            ):
+            if not valid_price:
                 prices_fresh = False
-        holdings_fresh = bool(holdings) and all(
-            cutoff <= row.updated_at <= now for row in holdings
-        )
+        holdings_fresh = all(row.updated_at <= now for row in holdings)
         buckets = list(self.session.scalars(select(CashBucket)))
         required = {BucketKind.RESERVE.value, BucketKind.INVESTMENT.value}
         cash_fresh = required <= {row.bucket_kind for row in buckets} and all(
-            cutoff <= row.updated_at <= now
+            row.updated_at <= now
             for row in buckets
             if row.bucket_kind in required
         )
@@ -896,7 +885,7 @@ class DailyCheck:
                     reason_code=decision.reason_code,
                     trigger="组合存在配置缺口，历史估值未处于高位，且近期没有追高信号。",
                     max_risk="基金仍可能继续下跌，投入本金可能发生损失。",
-                    stop_discipline="分批执行；数据转为陈旧或估值升至高位时停止买入。",
+                    stop_discipline="分批执行；关键数据缺失或估值升至高位时停止买入。",
                     source=history[-1].source,
                     timestamp=history[-1].fetched_at,
                     asset_id=asset.id,
@@ -937,10 +926,6 @@ class DailyCheck:
         advice: list[Advice],
     ) -> Notification:
         summary_freshness = dict(freshness)
-        if snapshot is not None and not snapshot.data_complete:
-            summary_freshness.update(
-                prices_fresh=False, holdings_fresh=False, cash_fresh=False
-            )
         total = (
             "未知"
             if snapshot is None or snapshot.total_value_cents is None
@@ -949,14 +934,11 @@ class DailyCheck:
         buckets = list(
             self.session.scalars(select(CashBucket).order_by(CashBucket.bucket_kind))
         )
+        bucket_labels = {"reserve": "生活备用金", "investment": "可投资现金"}
         bucket_text = (
             "、".join(
-                f"{row.bucket_kind}={self._yuan(row.balance_cents)}"
-                + (
-                    ""
-                    if summary_freshness["cash_fresh"]
-                    else "（账本记录，待确认）"
-                )
+                f"{bucket_labels.get(row.bucket_kind, '其他现金')}="
+                f"{self._yuan(row.balance_cents)}"
                 for row in buckets
             )
             or "未知"
@@ -966,18 +948,13 @@ class DailyCheck:
             f"{label}="
             + (
                 timestamp.astimezone(SHANGHAI).isoformat(timespec="minutes")
-                + (
-                    "（有效）"
-                    if summary_freshness[freshness_key]
-                    else "（待确认）"
-                )
                 if timestamp is not None
                 else "未知"
             )
-            for label, timestamp, freshness_key in (
-                ("价格", summary_freshness.get("price_as_of"), "prices_fresh"),
-                ("持仓", summary_freshness.get("holdings_as_of"), "holdings_fresh"),
-                ("现金", summary_freshness.get("cash_as_of"), "cash_fresh"),
+            for label, timestamp in (
+                ("价格", summary_freshness.get("price_as_of")),
+                ("持仓", summary_freshness.get("holdings_as_of")),
+                ("现金", summary_freshness.get("cash_as_of")),
             )
         )
         if not any(

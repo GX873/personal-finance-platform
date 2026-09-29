@@ -28,10 +28,10 @@ def test_dashboard_pages_require_login(client, path):
 def test_empty_dashboard_has_no_invented_balances(client):
     login(client)
     page = client.get("/").text
-    assert "未确认" in page and "待确认" in page
-    assert "WAIT" in page and "计划" in page
-    assert "4,000.00" in page and "2,700.00" in page
-    assert "尚未添加持仓" in page
+    assert "待补充" in page
+    assert '<div class="total-number"><span class="currency">¥</span> 待补充</div>' in page
+    assert "WAIT" in page
+    assert "2,700.00" in page
     assert client.get("/static/app.css").status_code == 200
 
 
@@ -48,7 +48,100 @@ def test_partial_snapshot_does_not_claim_total(client, db_session):
     login(client)
     page = client.get("/").text
     assert "1,234.56" in page and "已知部分" in page
-    assert "未确认" in page
+    assert "待补充" in page
+
+
+def test_dashboard_uses_recorded_cash_and_prices_without_stale_confirmation(
+    db_session, monkeypatch
+):
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from finance_app.ledger.models import Account, Asset, CashBucket, Holding
+    from finance_app.portfolio.models import PortfolioSnapshot, PriceSnapshot
+    from finance_app.web.viewmodels import dashboard
+
+    now = datetime(2026, 10, 10, 8, tzinfo=UTC)
+    monkeypatch.setattr("finance_app.web.viewmodels.utc_now", lambda: now)
+    account = Account(name="cash", kind="cash", currency="CNY")
+    asset = Asset(code="000001", market="CN", name="fund", currency="CNY")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Holding(account_id=account.id, asset_id=asset.id, quantity=Decimal(10)),
+            CashBucket(bucket_kind="reserve", balance_cents=100000, updated_at=now),
+            CashBucket(bucket_kind="investment", balance_cents=20000, updated_at=now),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=now.date(),
+                source="eastmoney",
+                price=Decimal(10),
+                quote_type="official_nav",
+                fetched_at=now,
+            ),
+            PortfolioSnapshot(
+                snapshot_date=now.date(),
+                data_complete=False,
+                total_value_cents=None,
+                known_value_cents=100000,
+                invested_value_cents=100000,
+                cash_value_cents=120000,
+                details_json='{"holdings_fresh":false,"cash_fresh":false}',
+            ),
+        ]
+    )
+    db_session.commit()
+
+    data = dashboard(db_session)
+
+    assert data["total"] == "1,300.00"
+    assert data["advice_action"] == "HOLD"
+    assert data["cash_total"] == "1,200.00"
+
+
+def test_analysis_uses_chinese_cash_labels_without_stale_confirmation_copy(
+    client, db_session
+):
+    from finance_app.ledger.models import CashBucket
+
+    db_session.add_all(
+        [
+            CashBucket(bucket_kind="reserve", balance_cents=100000),
+            CashBucket(bucket_kind="investment", balance_cents=20000),
+        ]
+    )
+    db_session.commit()
+    login(client)
+
+    page = client.get("/analysis").text
+
+    assert "生活备用金" in page
+    assert "可投资现金" in page
+    assert "reserve" not in page
+    assert "investment" not in page
+    assert "请确认是否陈旧" not in page
+
+
+def test_dashboard_exposes_cash_and_role_chart_data(db_session):
+    from finance_app.ledger.models import CashBucket
+
+    db_session.add_all(
+        [
+            CashBucket(bucket_kind="reserve", balance_cents=100000),
+            CashBucket(bucket_kind="investment", balance_cents=20000),
+        ]
+    )
+    db_session.commit()
+
+    from finance_app.web.viewmodels import dashboard
+
+    data = dashboard(db_session)
+
+    assert data["cash_chart"]["total_cents"] == 120000
+    assert data["cash_chart"]["segments"][0]["label"] == "生活备用金"
+    assert data["cash_chart"]["segments"][1]["label"] == "可投资现金"
+    assert data["role_chart"]["total_cents"] == 0
 
 
 def test_preview_is_explicit_and_never_reads_real_data(client, monkeypatch, db_session):
@@ -149,14 +242,14 @@ def test_fresh_complete_data_waits_for_configuration_then_stales(
     data = dashboard(db_session)
     assert data["known"] is None
     assert data["advice_action"] == "HOLD"
-    assert data["advice_status"] == "待配置"
-    assert data["freshness_label"] == "数据有效"
+    assert data["advice_status"] == "已录入"
+    assert data["freshness_label"] == "数据已录入"
     monkeypatch.setattr(
         "finance_app.web.viewmodels.utc_now", lambda: now + timedelta(days=2)
     )
     stale = dashboard(db_session)
-    assert stale["advice_action"] == "WAIT_FOR_DATA"
-    assert stale["freshness_label"] == "数据待更新"
+    assert stale["advice_action"] == "HOLD"
+    assert stale["freshness_label"] == "数据已录入"
 
 
 @pytest.mark.parametrize(

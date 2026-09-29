@@ -161,7 +161,7 @@ def test_snapshot_prefers_manual_nav_and_ignores_intraday_estimate():
         )
 
 
-def test_stale_and_future_price_do_not_become_complete():
+def test_recorded_official_nav_remains_usable_and_future_price_is_ignored():
     engine = create_db_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -194,7 +194,7 @@ def test_stale_and_future_price_do_not_become_complete():
         row = create_daily_snapshot(
             session, now=NOW, holdings_confirmed_at=NOW, cash_confirmed_at=NOW
         )
-        assert row.total_value_cents is None and row.known_value_cents == 200
+        assert row.total_value_cents == 200 and row.known_value_cents == 200
 
 
 def test_snapshot_rejects_future_confirmation_and_backward_time():

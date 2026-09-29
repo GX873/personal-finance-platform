@@ -1,0 +1,15 @@
+.visual-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px;margin-top:22px}
+.distribution-panel{min-height:190px}
+.distribution-bar{display:flex;height:13px;gap:3px;margin:24px 0 19px;background:#e7e8dd;border-radius:4px;overflow:hidden}
+.distribution-bar span{display:block;min-width:0;background:var(--teal);transition:width .3s ease}
+.cash-distribution span:nth-child(2),.role-distribution span:nth-child(2){background:#ba9866}
+.distribution-legend{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.distribution-legend>div{display:grid;grid-template-columns:8px 1fr auto;align-items:center;column-gap:8px;font-size:10px;color:var(--muted)}
+.distribution-legend i{width:7px;height:7px;border-radius:50%;background:var(--teal)}
+.distribution-legend>div:nth-child(2) i{background:#ba9866}
+.distribution-legend strong{font-family:Georgia,serif;font-weight:normal;color:var(--ink);text-align:right}
+.distribution-legend small{display:block;color:var(--muted);font-family:var(--sans);font-size:9px}
+.analysis-bars{margin-top:20px}
+.analysis-bars>div:not(.meter){display:flex;justify-content:space-between;font-size:11px;margin-top:12px}
+.analysis-bars .meter{margin:5px 0 11px}
+@media(max-width:900px){.visual-grid{grid-template-columns:1fr}}

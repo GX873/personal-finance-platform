@@ -1,7 +1,6 @@
 """Read-only dashboard data; missing observations never become zero balances."""
 
-import json
-from datetime import datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
 from sqlalchemy import case, func, select
@@ -16,12 +15,12 @@ from finance_app.portfolio.models import (
     PortfolioSnapshot,
     PriceSnapshot,
 )
-from finance_app.portfolio.rules import SHANGHAI, expected_nav_date, nav_is_fresh
+from finance_app.portfolio.rules import SHANGHAI
 from finance_app.portfolio.service import value_cents
 
 
 def money(cents: int | None) -> str:
-    return "待确认" if cents is None else f"{Decimal(cents) / 100:,.2f}"
+    return "待补充" if cents is None else f"{Decimal(cents) / 100:,.2f}"
 
 
 def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
@@ -94,6 +93,7 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
         )
     holdings = []
     role_values = {"core": 0, "satellite": 0}
+    priced_holdings_total = 0
     if db:
         for holding, asset, account in db.execute(
             select(Holding, Asset, Account)
@@ -147,6 +147,8 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
             )
             if amount and asset.portfolio_role in role_values:
                 role_values[asset.portfolio_role] += amount
+            if amount:
+                priced_holdings_total += amount
             holdings.append(
                 {
                     "name": asset.name,
@@ -156,28 +158,39 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
                     "cost": money(holding.cost_cents),
                     "currency": asset.currency,
                     "role": "核心" if asset.portfolio_role == "core" else "卫星",
-                    "nav": format(price.price.normalize(), "f") if price else "待确认",
+                    "nav": format(price.price.normalize(), "f") if price else "待补充",
                     "date": price.valuation_date.isoformat() if price else "—",
                     "source": price.source if price else "无有效来源",
                     "estimate": estimate,
                     "quote_type": price.quote_type if price else None,
                     "value": money(amount),
-                    "fresh": bool(
-                        price
-                        and not estimate
-                        and nav_is_fresh(price.valuation_date, price.fetched_at, now)
-                    ),
+                    "fresh": bool(price and not estimate),
                     "priced": amount is not None,
                     "updated_at": holding.updated_at,
                 }
             )
     if section == "holdings":
         return {"today": today.isoformat(), "holdings": holdings}
+    cash_total_cents = (
+        balances["reserve"] + balances["investment"]
+        if balances["reserve"] is not None and balances["investment"] is not None
+        else None
+    )
+    holdings_complete = len(holdings) == 0 or all(
+        holding["priced"] for holding in holdings
+    )
+    current_total_cents = (
+        priced_holdings_total + cash_total_cents
+        if holdings_complete and cash_total_cents is not None
+        else None
+    )
     series = {
         row.snapshot_date: row.total_value_cents
         for row in snapshots
         if row.data_complete and row.total_value_cents is not None
     }
+    if current_total_cents is not None:
+        series[today] = current_total_cents
     days = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
     values = [series[day] for day in days if day in series]
     low, high = (min(values), max(values)) if values else (0, 0)
@@ -205,50 +218,53 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
         if db
         else []
     )
-    complete = bool(
-        latest and latest.data_complete and latest.total_value_cents is not None
+    display_total_cents = current_total_cents
+    if display_total_cents is None and latest and latest.data_complete:
+        display_total_cents = latest.total_value_cents
+    known_cash_cents = sum(value for value in balances.values() if value is not None)
+    known_cents = (
+        priced_holdings_total + known_cash_cents
+        if priced_holdings_total or known_cash_cents
+        else (latest.known_value_cents if latest else None)
     )
-    # A complete historical valuation alone cannot certify today's data.
-    fresh = False
-    if complete and latest and latest.details_json:
-        try:
-            details = json.loads(latest.details_json)
-            as_of = datetime.fromisoformat(details["as_of"])
-            fresh = bool(
-                as_of.utcoffset() is not None
-                and as_of <= now
-                and as_of.astimezone(SHANGHAI).date() >= expected_nav_date(now)
-                and all(
-                    details.get(key) is True
-                    for key in ("holdings_fresh", "cash_fresh", "currency_supported")
-                )
-                and all(
-                    balances[kind] is not None for kind in ("reserve", "investment")
-                )
-                and all(
-                    expected_nav_date(now) <= row.updated_at.astimezone(SHANGHAI).date()
-                    and row.updated_at <= as_of
-                    for row in buckets
-                )
-                and all(
-                    h["fresh"] and h["priced"] and h["updated_at"] <= as_of
-                    for h in holdings
-                )
-            )
-        except (ValueError, TypeError, KeyError, AttributeError):
-            fresh = False
+    cash_segments = [
+        {
+            "label": label,
+            "kind": kind,
+            "value_cents": balances[kind] or 0,
+            "amount": money(balances[kind]),
+            "percent": (
+                (balances[kind] or 0) / cash_total_cents * 100
+                if cash_total_cents
+                else 0
+            ),
+        }
+        for kind, label in (
+            ("reserve", "生活备用金"),
+            ("investment", "可投资现金"),
+        )
+    ]
+    role_total_cents = sum(role_values.values())
+    role_segments = [
+        {
+            "label": label,
+            "kind": kind,
+            "value_cents": role_values[kind],
+            "amount": money(role_values[kind]),
+            "percent": (
+                role_values[kind] / role_total_cents * 100
+                if role_total_cents
+                else 0
+            ),
+        }
+        for kind, label in (("core", "核心资产"), ("satellite", "卫星资产"))
+    ]
     return {
         "today": today.isoformat(),
-        "total": money(latest.total_value_cents)
-        if latest and latest.data_complete and latest.total_value_cents is not None
-        else "未确认",
+        "total": money(display_total_cents) if display_total_cents is not None else "待补充",
         "snapshot_date": latest.snapshot_date.isoformat() if latest else "尚无快照",
-        "known": money(latest.known_value_cents) if latest and not complete else None,
-        "freshness_label": "数据有效"
-        if fresh
-        else "数据待更新"
-        if complete
-        else "数据待完善",
+        "known": money(known_cents) if display_total_cents is None and known_cents else None,
+        "freshness_label": "数据已录入" if display_total_cents is not None else "待补充",
         "reserve": money(balances["reserve"]),
         "investment": money(balances["investment"]),
         "reserve_date": balance_dates["reserve"],
@@ -257,6 +273,16 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
         "priced_count": sum(h["priced"] for h in holdings),
         "role_values": role_values,
         "priced_total": sum(role_values.values()),
+        "cash_total": money(cash_total_cents),
+        "cash_total_cents": cash_total_cents or 0,
+        "cash_chart": {
+            "total_cents": cash_total_cents or 0,
+            "segments": cash_segments,
+        },
+        "role_chart": {
+            "total_cents": role_total_cents,
+            "segments": role_segments,
+        },
         "budget": [
             {
                 "label": label,
@@ -280,12 +306,12 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
         )
         if db
         else [],
-        "advice_action": "HOLD" if fresh else "WAIT_FOR_DATA",
-        "advice_heading": "数据已就绪，先确认投资配置。"
-        if fresh
-        else "先把数据补齐，再做决定。",
-        "advice_status": "待配置" if fresh else "等待确认",
-        "advice_reason": "现金、持仓与净值数据有效。风险偏好、适用配置与本月剩余额度尚未联合确认，暂不建议新增操作。"
-        if fresh
-        else "请先补齐或更新现金、持仓与净值，并确认数据来源和日期，再评估操作。",
+        "advice_action": "HOLD" if display_total_cents is not None else "WAIT_FOR_DATA",
+        "advice_heading": "数据已录入，可以查看资产分布。"
+        if display_total_cents is not None
+        else "先把缺失数据补齐。",
+        "advice_status": "已录入" if display_total_cents is not None else "待补充",
+        "advice_reason": "总资产按已记录的现金、持仓份额和正式净值计算；系统不会因为日期较早要求重复确认。"
+        if display_total_cents is not None
+        else "缺少现金、持仓或正式净值，暂不把缺失金额当作零。",
     }

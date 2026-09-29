@@ -33,7 +33,6 @@ def valid_form(client):
         "core_target_percent": "70.00",
         "satellite_target_percent": "30.00",
         "satellite_upper_percent": "10.00",
-        "stale_threshold_hours": "36",
         "enabled_channels": ["email", "pushplus"],
     }
 
@@ -104,7 +103,6 @@ def test_settings_save_non_secrets_with_csrf_prg_and_audit(client, db_session):
         "daily_schedule": "14:00",
         "cn_holidays": "[]",
         "reserve_target_cents": "100000",
-        "stale_threshold_hours": "36",
     }
     targets = {
         row.name: (row.target_bps, row.upper_bps)
@@ -178,8 +176,6 @@ def test_settings_toggle_existing_channel_names_without_creating_duplicates(
         ("core_target_percent", "70.001"),
         ("core_target_percent", "80.00"),
         ("satellite_upper_percent", "31.00"),
-        ("stale_threshold_hours", "0"),
-        ("stale_threshold_hours", "721"),
         ("enabled_channels", "https://evil.example/token"),
     ],
 )
@@ -203,12 +199,22 @@ def test_settings_post_requires_csrf(client):
     assert client.post("/settings", data={}).status_code == 403
 
 
+def test_settings_do_not_expose_stale_data_confirmation(client):
+    assert login(client).status_code == 303
+
+    page = client.get("/settings")
+
+    assert page.status_code == 200
+    assert 'name="stale_threshold_hours"' not in page.text
+    assert "数据陈旧阈值" not in page.text
+
+
 def test_analysis_shows_unknown_total_and_no_fabricated_market_data(client):
     assert login(client).status_code == 303
 
     page = client.get("/analysis")
 
     assert page.status_code == 200
-    assert "总资产未知" in page.text
-    assert "等待数据" in page.text
-    assert "不推测行情" in page.text
+    assert "总资产待补充" in page.text
+    assert "缺少现金、持仓或正式净值" in page.text
+    assert "缺失金额当作零" in page.text

@@ -508,6 +508,43 @@ def test_freshness_never_treats_intraday_estimate_as_official_nav(db_session):
     assert freshness["sources"] == []
 
 
+def test_recorded_cash_and_official_nav_do_not_expire_by_age(db_session):
+    old = NOW - timedelta(days=30)
+    account = Account(name="cash", kind="cash")
+    asset = Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Holding(
+                account_id=account.id,
+                asset_id=asset.id,
+                quantity=Decimal(1),
+                updated_at=old,
+            ),
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=old),
+            CashBucket(bucket_kind="investment", balance_cents=20_000, updated_at=old),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=old.date(),
+                price=Decimal("1.2"),
+                source="manual:user-entry",
+                quote_type="official_nav",
+                fetched_at=old,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    freshness = DailyCheck(db_session, clock=lambda: NOW).validate_freshness(
+        date(2026, 9, 23)
+    )
+
+    assert freshness["prices_fresh"] is True
+    assert freshness["holdings_fresh"] is True
+    assert freshness["cash_fresh"] is True
+
+
 def test_freshness_prefers_manual_nav_over_newer_same_day_automatic_source(
     db_session,
 ):
@@ -694,7 +731,8 @@ def test_incomplete_snapshot_forces_wait_even_if_threshold_flags_are_true(db_ses
     digest = DailyCheck(db_session, clock=lambda: NOW).build_digest(
         date(2026, 9, 23), snapshot, freshness, advice
     )
-    assert "账本记录，待确认" in digest.body
+    assert "账本记录，待确认" not in digest.body
+    assert "（待确认）" not in digest.body
     assert "（有效）" not in digest.body
 
 
@@ -1040,7 +1078,7 @@ def test_fresh_reserve_shortfall_survives_missing_holdings_and_alerts(db_session
     assert [critical for _title, critical in check.notifications] == [False, True]
 
 
-def test_stale_cash_does_not_fabricate_reserve_shortfall(db_session):
+def test_recorded_cash_age_does_not_hide_reserve_shortfall(db_session):
     stale = NOW - timedelta(days=2)
     db_session.add_all(
         [
@@ -1062,8 +1100,11 @@ def test_stale_cash_does_not_fabricate_reserve_shortfall(db_session):
 
     assert check.run(date(2026, 9, 23)) is DailyCheckResult.SUCCESS
 
-    assert [item.reason_code for item in check.advice] == ["DATA_UNCONFIRMED"]
-    assert [critical for _title, critical in check.notifications] == [False]
+    assert [item.reason_code for item in check.advice] == [
+        "DATA_UNCONFIRMED",
+        "RESERVE_SHORTFALL",
+    ]
+    assert [critical for _title, critical in check.notifications] == [False, True]
 
 
 def test_unknown_reserve_does_not_fabricate_shortfall(db_session):

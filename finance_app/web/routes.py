@@ -65,7 +65,6 @@ _SETTING_FIELDS = {
     "core_target_percent",
     "satellite_target_percent",
     "satellite_upper_percent",
-    "stale_threshold_hours",
     "enabled_channels",
 }
 _CHANNEL_TYPES = ("email", "pushplus", "serverchan", "wecom")
@@ -155,7 +154,6 @@ def _settings_values(db: Session) -> dict[str, object]:
             f"{(satellite.target_bps if satellite else 3000) / 100:.2f}"
         ),
         "satellite_upper_percent": f"{(satellite_each.upper_bps if satellite_each and satellite_each.upper_bps is not None else 1000) / 100:.2f}",
-        "stale_threshold_hours": _stored_setting(db, "stale_threshold_hours", "36"),
         "enabled_channels": enabled,
     }
 
@@ -436,14 +434,6 @@ async def update_settings(
             raise FormError("核心与卫星目标比例之和必须为 100%。")
         if satellite_upper_bps > satellite_bps:
             raise FormError("单一卫星上限不能高于全部卫星目标。")
-        stale_text = required_text(
-            form.get("stale_threshold_hours"), "陈旧阈值", maximum=3
-        )
-        if re.fullmatch(r"[1-9][0-9]{0,2}", stale_text) is None:
-            raise FormError("陈旧阈值须为 1 至 720 小时的整数。")
-        stale_hours = int(stale_text)
-        if stale_hours > 720:
-            raise FormError("陈旧阈值须为 1 至 720 小时的整数。")
         enabled_channels = form.getlist("enabled_channels")
         existing_channels = list(
             db.scalars(select(NotificationChannel).order_by(NotificationChannel.id))
@@ -471,9 +461,6 @@ async def update_settings(
             "reserve_target_cents": int(
                 _stored_setting(db, "reserve_target_cents", "100000")
             ),
-            "stale_threshold_hours": int(
-                _stored_setting(db, "stale_threshold_hours", "36")
-            ),
             "allocation_targets": previous_targets,
             "enabled_channels": sorted(
                 row.name for row in existing_channels if row.enabled
@@ -483,7 +470,6 @@ async def update_settings(
         _upsert_setting(db, "daily_schedule", schedule)
         _upsert_setting(db, "cn_holidays", serialize_holidays(holidays))
         _upsert_setting(db, "reserve_target_cents", str(reserve_target))
-        _upsert_setting(db, "stale_threshold_hours", str(stale_hours))
         _upsert_target(db, "core", core_bps, None)
         _upsert_target(db, "satellite", satellite_bps, None)
         _upsert_target(db, "satellite_each", 0, satellite_upper_bps)
@@ -514,7 +500,6 @@ async def update_settings(
                     "core_target_bps": core_bps,
                     "satellite_target_bps": satellite_bps,
                     "satellite_upper_bps": satellite_upper_bps,
-                    "stale_threshold_hours": stale_hours,
                     "enabled_channels": sorted(enabled_channels),
                 },
             )
@@ -556,6 +541,7 @@ def analysis_page(request: Request, db: Annotated[Session, Depends(get_db)]):
         {
             "snapshot": snapshot,
             "snapshot_details": details,
+            "overview": dashboard(db),
             "cash_buckets": list(
                 db.scalars(select(CashBucket).order_by(CashBucket.bucket_kind))
             ),

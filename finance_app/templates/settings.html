@@ -16,7 +16,6 @@
       <label>核心资产目标（%）<input required inputmode="decimal" name="core_target_percent" value="{{ values.core_target_percent }}"></label>
       <label>卫星资产目标（%）<input required inputmode="decimal" name="satellite_target_percent" value="{{ values.satellite_target_percent }}"></label>
       <label>单一卫星资产上限（%）<input required inputmode="decimal" name="satellite_upper_percent" value="{{ values.satellite_upper_percent }}"></label>
-      <label>数据陈旧阈值（小时）<input required inputmode="numeric" name="stale_threshold_hours" value="{{ values.stale_threshold_hours }}"></label>
       <fieldset><legend>启用通知通道</legend>
       {% for name,label,channel_type in channels %}
         <label><input type="checkbox" name="enabled_channels" value="{{ name }}" {{ 'checked' if name in values.enabled_channels }}>{{ label }}</label>

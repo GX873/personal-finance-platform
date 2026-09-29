@@ -1,29 +1,30 @@
 {% extends "base.html" %}
 {% block title %}投资分析{% endblock %}
 {% block eyebrow %}ANALYSIS{% endblock %}
-{% block heading %}先确认数据，再讨论行动。{% endblock %}
-{% block subtitle %}缺失或陈旧的数据只产生条件式建议，系统不推测行情，也不自动交易。{% endblock %}
+{% block heading %}看懂资产，再安排下一步。{% endblock %}
+{% block subtitle %}这里展示已记录的资产、现金和配置，不把缺失数据假设成零。{% endblock %}
 {% block content %}
 <div class="form-grid">
   <section class="panel">
-    <div class="section-heading"><h2>最近每日快照</h2><span class="pill">{{ snapshot.snapshot_date if snapshot else '等待数据' }}</span></div>
-    {% if snapshot and snapshot.total_value_cents is not none %}
-      <p class="metric-value">¥ {{ snapshot.total_value_cents|money }}</p>
-      <p class="hint">完整总资产 · 数据时间 {{ snapshot_details.get('as_of', '未知') }}。</p>
+    <div class="section-heading"><h2>当前总资产</h2><span class="pill">{{ overview.freshness_label }}</span></div>
+    {% if overview.total != '待补充' %}
+      <p class="metric-value">¥ {{ overview.total }}</p>
+      <p class="hint">按已记录的现金与正式净值计算 · 最近记录 {{ overview.snapshot_date }}。</p>
     {% else %}
-      <p class="metric-value">总资产未知</p>
-      <p class="hint">等待数据：当前仅展示已确认记录，不推测行情或补齐缺失估值。</p>
-      {% if snapshot %}<p>已知部分：¥ {{ snapshot.known_value_cents|money }}</p>{% endif %}
+      <p class="metric-value">总资产待补充</p>
+      <p class="hint">缺少现金、持仓或正式净值，暂不把缺失金额当作零。</p>
+      {% if overview.known %}<p>已知部分：¥ {{ overview.known }}</p>{% endif %}
     {% endif %}
   </section>
   <section class="panel">
-    <div class="section-heading"><h2>现金桶</h2><span class="pill">账本记录 · 待核对时效</span></div>
+    <div class="section-heading"><h2>现金分配</h2><span class="pill">账本记录</span></div>
     {% if cash_buckets %}<ul class="record-list">
-      {% for bucket in cash_buckets %}<li><strong>{{ bucket.bucket_kind }}</strong><span>账本记录 ¥ {{ bucket.balance_cents|money }} · 更新于 {{ bucket.updated_at|shanghai_datetime }} · 请确认是否陈旧</span></li>{% endfor %}
-    </ul>{% else %}<p class="hint">尚无已确认现金桶。</p>{% endif %}
+      {% for bucket in cash_buckets %}<li><strong>{{ '生活备用金' if bucket.bucket_kind == 'reserve' else '可投资现金' if bucket.bucket_kind == 'investment' else '其他现金' }}</strong><span>¥ {{ bucket.balance_cents|money }} · 更新于 {{ bucket.updated_at|shanghai_datetime }}</span></li>{% endfor %}
+    </ul>{% else %}<p class="hint">尚无现金记录。</p>{% endif %}
   </section>
 </div>
-<section class="panel"><div class="section-heading"><h2>行动边界</h2><span class="pill">条件式建议</span></div>
-  <p>数据完整且新鲜后，系统才会依据储备金、投资预算和核心/卫星上限生成建议。任何金额、比例、触发条件、最大风险与止损纪律都必须人工复核。</p>
+<section class="panel analysis-summary"><div class="section-heading"><h2>资产分布</h2><span class="pill">直观看比例</span></div>
+  <div class="analysis-bars"><div><span>生活备用金</span><strong>{{ overview.cash_chart.segments[0].percent|round(1) }}%</strong></div><div class="meter"><span style="width:{{ overview.cash_chart.segments[0].percent }}%"></span></div><div><span>可投资现金</span><strong>{{ overview.cash_chart.segments[1].percent|round(1) }}%</strong></div><div class="meter"><span style="width:{{ overview.cash_chart.segments[1].percent }}%"></span></div></div>
+  <p class="hint">建议只作为信息整理，不会自动买入或卖出。</p>
 </section>
 {% endblock %}
