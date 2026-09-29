@@ -31,12 +31,18 @@ _EXPORT_FIELDS: dict[str, tuple[str, ...]] = {
     "monthly_budgets": ("id", "month", "bucket_kind", "amount_cents", "created_at"),
     "notification_channels": ("id", "name", "channel_type", "enabled", "created_at", "updated_at"),
     "notification_deliveries": ("id", "channel_id", "title", "status", "attempt_count", "error_summary", "delivered_at", "created_at"),
+    "opportunity_alerts": ("id", "code", "cycle_start", "action", "amount_cents", "reason_code", "data_as_of", "used_special_budget", "created_at"),
     "portfolio_snapshots": ("id", "snapshot_date", "total_value_cents", "known_value_cents", "data_complete", "details_json", "invested_value_cents", "cash_value_cents", "created_at"),
-    "price_snapshots": ("id", "asset_id", "valuation_date", "source", "price", "source_url", "fetched_at", "error_text"),
+    "price_snapshots": ("id", "asset_id", "valuation_date", "source", "price", "quote_type", "source_url", "fetched_at", "error_text"),
     "transactions": ("id", "source", "external_id", "kind", "account_id", "asset_id", "amount_cents", "quantity", "price", "fee_cents", "occurred_at", "description", "reverses_transaction_id", "created_at"),
     "users": ("id", "username", "is_active", "created_at", "updated_at"),
 }
-_SAFE_SETTING_KEYS = {"daily_schedule", "reserve_target_cents", "stale_threshold_hours"}
+_SAFE_SETTING_KEYS = {
+    "daily_schedule",
+    "cn_holidays",
+    "reserve_target_cents",
+    "stale_threshold_hours",
+}
 _SECRET_MARKERS = (
     "api_key",
     "apikey",

@@ -531,7 +531,7 @@ def test_reversal_of_missing_transaction_remains_404(client):
     assert response.status_code == 404
 
 
-def test_manual_price_is_audited_idempotent_and_conflicts_on_change(client, db_session):
+def test_manual_price_is_audited_idempotent_and_can_be_edited(client, db_session):
     asset = add_asset(db_session)
     assert login(client).status_code == 303
     data = {
@@ -546,20 +546,34 @@ def test_manual_price_is_audited_idempotent_and_conflicts_on_change(client, db_s
     assert first.headers["location"] == "/prices/new"
     second = client.post("/prices", data=data)
     assert second.status_code == 303
-    changed = {**data, "price": "1.25"}
-    conflict = client.post("/prices", data=changed)
-    assert conflict.status_code == 422
+    snapshot = db_session.scalar(select(PriceSnapshot))
+    edit_page = client.get(f"/prices/{snapshot.id}/edit")
+    assert edit_page.status_code == 200
+    changed = {
+        **data,
+        "price": "1.25",
+        "csrf_token": csrf(client, f"/prices/{snapshot.id}/edit"),
+    }
+    updated = client.post(f"/prices/{snapshot.id}", data=changed)
+    assert updated.status_code == 303
     db_session.expire_all()
     prices = list(db_session.scalars(select(PriceSnapshot)))
     assert len(prices) == 1
     assert prices[0].source == "manual:fund-statement"
-    assert prices[0].price == Decimal("1.23456789")
+    assert prices[0].price == Decimal("1.25")
     events = list(
         db_session.scalars(
             select(AuditEvent).where(AuditEvent.event_type == "price.created")
         )
     )
     assert len(events) == 1
+    updated_event = db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "price.updated")
+    )
+    assert updated_event is not None
+    details = json.loads(updated_event.details_json)
+    assert details["summary"]["old"]["price"] == "1.23456789"
+    assert details["summary"]["new"]["price"] == "1.25"
 
 
 @pytest.mark.parametrize(

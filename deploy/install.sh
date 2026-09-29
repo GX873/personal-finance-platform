@@ -78,7 +78,7 @@ if [[ ! -e "$RELEASE_DIR" ]]; then
 fi
 python3 -m venv "$RELEASE_DIR/.venv"
 "$RELEASE_DIR/.venv/bin/python" -m pip install --upgrade pip
-"$RELEASE_DIR/.venv/bin/python" -m pip install "$RELEASE_DIR"
+"$RELEASE_DIR/.venv/bin/python" -m pip install "$RELEASE_DIR[market-analysis]"
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
 # The release is immutable application code; only state directories are writable.
@@ -93,8 +93,8 @@ if [[ ! -e "$ENV_FILE" ]]; then
         'FINANCE_ENVIRONMENT=production' \
         'FINANCE_DATABASE_URL=sqlite:////var/lib/personal-finance/data/finance.db' \
         "FINANCE_SECRET_KEY=$generated_secret" \
-        'FINANCE_SESSION_HTTPS_ONLY=false' \
-        '# HTTP-only bootstrap without TLS; set true only after configuring TLS.' > "$ENV_FILE"
+        'FINANCE_SESSION_HTTPS_ONLY=true' \
+        '# Keep true: the supported remote entry point is Tailnet-only HTTPS via Tailscale Serve.' > "$ENV_FILE"
 fi
 chown financeapp:financeapp "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
@@ -129,8 +129,8 @@ systemctl reload-or-restart nginx
 
 cat <<'MESSAGE'
 Installation completed. The application is prepared but is not started until its
-database migration and administrator are initialized. The remaining manual Alibaba
-Cloud security group action is: add an inbound TCP 80 rule to this ECS instance
-(source restricted to the required clients where possible). No cloud firewall rule
-was changed by this script.
+database migration and administrator are initialized. Nginx listens only on the
+server loopback interface. Configure Tailnet-only HTTPS with Tailscale Serve before
+logging in; do not add public TCP 80 or 443 security group rules. No cloud firewall
+rule was changed by this script.
 MESSAGE

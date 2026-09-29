@@ -309,6 +309,7 @@ def test_metadata_includes_initial_migration_tables_and_constraints(
         "monthly_budgets",
         "notification_channels",
         "notification_deliveries",
+            "opportunity_alerts",
         "portfolio_snapshots",
         "price_snapshots",
         "transactions",
@@ -322,5 +323,5 @@ def test_metadata_includes_initial_migration_tables_and_constraints(
     assert PriceSnapshot.__table__.c.price.type.scale == 8
     assert (
         db_session.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        == "0002"
+        == "0004"
     )

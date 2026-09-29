@@ -83,7 +83,7 @@ _REQUIRED_SCHEMA = {
     "audit_events": {"id", "event_type", "created_at"},
     "alembic_version": {"version_num"},
 }
-_SCHEMA_REVISION = "0002"
+_SCHEMA_REVISION = "0004"
 
 
 def _database_path(source: Any | None) -> Path:

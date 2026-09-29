@@ -21,6 +21,7 @@ from finance_app.auth.service import (
     require_csrf,
     require_user,
 )
+from finance_app.calendar import parse_holidays, serialize_holidays
 from finance_app.config import get_settings
 from finance_app.db import get_db, utc_now
 from finance_app.ledger.models import (
@@ -58,6 +59,7 @@ router = APIRouter()
 _SETTING_FIELDS = {
     "csrf_token",
     "daily_schedule",
+    "cn_holidays",
     "reserve_target",
     "core_target_percent",
     "satellite_target_percent",
@@ -142,7 +144,8 @@ def _settings_values(db: Session) -> dict[str, object]:
     satellite = targets.get("satellite")
     satellite_each = targets.get("satellite_each")
     return {
-        "daily_schedule": _stored_setting(db, "daily_schedule", "09:00"),
+        "daily_schedule": _stored_setting(db, "daily_schedule", "14:00"),
+        "cn_holidays": _stored_setting(db, "cn_holidays", "[]"),
         "reserve_target": money(
             int(_stored_setting(db, "reserve_target_cents", "100000"))
         ).replace(",", ""),
@@ -213,6 +216,7 @@ def _manual_page(
     values: dict[str, str] | None = None,
     account_values: dict[str, str] | None = None,
     asset_values: dict[str, str] | None = None,
+    editing_price_id: int | None = None,
 ):
     context = _base_context(request, user, section)
     context.update(
@@ -224,6 +228,24 @@ def _manual_page(
             "account_values": account_values or {},
             "asset_values": asset_values or {},
             "local_now": datetime.now(SHANGHAI).strftime("%Y-%m-%dT%H:%M"),
+            "price_rows": (
+                list(
+                    db.scalars(
+                        select(PriceSnapshot)
+                        .order_by(
+                            PriceSnapshot.valuation_date.desc(),
+                            PriceSnapshot.id.desc(),
+                        )
+                        .limit(100)
+                    )
+                )
+                if name == "price_form.html"
+                else []
+            ),
+            "price_asset_names": {
+                row.id: row.name for row in db.scalars(select(Asset))
+            },
+            "editing_price_id": editing_price_id,
         }
     )
     return templates.TemplateResponse(
@@ -327,6 +349,36 @@ def price_form(request: Request, db: Annotated[Session, Depends(get_db)]):
     return _manual_page(request, db, user, name="price_form.html", section="prices")
 
 
+@router.get("/prices/{price_id}/edit", response_class=HTMLResponse)
+def edit_price_form(
+    price_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    snapshot = db.get(PriceSnapshot, price_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Price not found")
+    if not snapshot.source.startswith("manual:"):
+        raise HTTPException(status_code=403, detail="Only manual prices can be edited")
+    return _manual_page(
+        request,
+        db,
+        user,
+        name="price_form.html",
+        section="prices",
+        values={
+            "asset_id": str(snapshot.asset_id),
+            "valuation_date": snapshot.valuation_date.isoformat(),
+            "price": format(snapshot.price, "f"),
+            "source": snapshot.source,
+        },
+        editing_price_id=snapshot.id,
+    )
+
+
 @router.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request, db: Annotated[Session, Depends(get_db)]):
     user = current_user(request, db)
@@ -365,6 +417,10 @@ async def update_settings(
         schedule = required_text(form.get("daily_schedule"), "每日时间", maximum=5)
         if _SCHEDULE.fullmatch(schedule) is None:
             raise FormError("每日时间须为 24 小时制 HH:MM。")
+        holiday_text = required_text(
+            form.get("cn_holidays") or "[]", "法定节假日", maximum=4096
+        )
+        holidays = parse_holidays(holiday_text)
         reserve_target = parse_yuan(
             form.get("reserve_target"), "储备金目标", positive=True
         )
@@ -409,7 +465,8 @@ async def update_settings(
             for row in db.scalars(select(AllocationTarget)).all()
         }
         previous = {
-            "daily_schedule": _stored_setting(db, "daily_schedule", "09:00"),
+            "daily_schedule": _stored_setting(db, "daily_schedule", "14:00"),
+            "cn_holidays": _stored_setting(db, "cn_holidays", "[]"),
             "reserve_target_cents": int(
                 _stored_setting(db, "reserve_target_cents", "100000")
             ),
@@ -423,6 +480,7 @@ async def update_settings(
         }
 
         _upsert_setting(db, "daily_schedule", schedule)
+        _upsert_setting(db, "cn_holidays", serialize_holidays(holidays))
         _upsert_setting(db, "reserve_target_cents", str(reserve_target))
         _upsert_setting(db, "stale_threshold_hours", str(stale_hours))
         _upsert_target(db, "core", core_bps, None)
@@ -799,6 +857,85 @@ async def create_price(
             status_code=422,
             error=str(exc),
             values=values,
+        )
+    return RedirectResponse("/prices/new", status_code=303)
+
+
+@router.post("/prices/{price_id}", dependencies=[Depends(require_csrf)])
+async def update_price(
+    price_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    snapshot = db.get(PriceSnapshot, price_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Price not found")
+    if not snapshot.source.startswith("manual:"):
+        raise HTTPException(status_code=403, detail="Only manual prices can be edited")
+    form = await request.form()
+    values = _form_values(form)
+    try:
+        asset_id = parse_id(form.get("asset_id"), "资产")
+        if asset_id is None or db.get(Asset, asset_id) is None:
+            raise FormError("所选资产不存在。")
+        valuation_date = parse_date(form.get("valuation_date"), "估值日期")
+        if valuation_date > utc_now().astimezone(SHANGHAI).date():
+            raise FormError("估值日期不能晚于今天。")
+        price = parse_decimal(form.get("price"), "价格", positive=True)
+        source = manual_source(form.get("source", ""))
+        duplicate = db.scalar(
+            select(PriceSnapshot).where(
+                PriceSnapshot.asset_id == asset_id,
+                PriceSnapshot.valuation_date == valuation_date,
+                PriceSnapshot.source == source,
+                PriceSnapshot.id != snapshot.id,
+            )
+        )
+        if duplicate is not None:
+            raise FormError("修改后的资产、日期和来源已存在另一条记录。")
+        old = {
+            "asset_id": snapshot.asset_id,
+            "valuation_date": snapshot.valuation_date.isoformat(),
+            "price": format(snapshot.price, "f"),
+            "source": snapshot.source,
+        }
+        snapshot.asset_id = asset_id
+        snapshot.valuation_date = valuation_date
+        snapshot.price = price
+        snapshot.source = source
+        snapshot.fetched_at = utc_now()
+        db.add(
+            audit_event(
+                user=user,
+                event_type="price.updated",
+                action="price.update",
+                entity_type="price_snapshot",
+                entity_id=snapshot.id,
+                summary={
+                    "old": old,
+                    "new": {
+                        "asset_id": asset_id,
+                        "valuation_date": valuation_date.isoformat(),
+                        "price": format(price, "f"),
+                        "source": source,
+                    },
+                },
+            )
+        )
+        db.commit()
+    except (FormError, IntegrityError, ValueError) as exc:
+        db.rollback()
+        return _manual_page(
+            request,
+            db,
+            user,
+            name="price_form.html",
+            section="prices",
+            status_code=422,
+            error=str(exc),
+            values=values,
+            editing_price_id=price_id,
         )
     return RedirectResponse("/prices/new", status_code=303)
 

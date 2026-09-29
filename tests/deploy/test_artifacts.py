@@ -53,7 +53,10 @@ def test_backup_timer_runs_online_backup_as_locked_user() -> None:
 
 def test_nginx_proxies_only_loopback_and_blocks_sensitive_files() -> None:
     config = read("nginx-finance.conf")
-    assert re.search(r"listen\s+80(?:\s|;)", config)
+    assert "listen 127.0.0.1:80 default_server;" in config
+    assert "listen [::1]:80 default_server;" in config
+    assert not re.search(r"(?m)^\s*listen\s+80(?:\s|;)", config)
+    assert not re.search(r"(?m)^\s*listen\s+\[::\]:80(?:\s|;)", config)
     assert "proxy_pass http://127.0.0.1:8000" in config
     assert "client_max_body_size 10m" in config
     assert "location ~ /\\." in config
@@ -99,7 +102,8 @@ def test_installer_is_root_only_and_ubuntu_24_04_idempotent() -> None:
     assert "systemctl daemon-reload" in script
     assert "systemctl enable" in script
     assert "security group" in script.lower()
-    assert "TCP 80" in script
+    assert "Tailscale" in script
+    assert "add an inbound TCP 80 rule" not in script
     assert "docker" not in script.lower()
     assert "sshd_config" not in script
 
@@ -123,8 +127,8 @@ def test_installer_publishes_a_clean_root_owned_git_release() -> None:
     assert 'cp -a "$SOURCE_DIR/.' not in script
     assert 'chown -R financeapp:financeapp "$STATE_ROOT" "$RELEASE_DIR"' not in script
     assert 'chown -R root:root "$RELEASE_DIR"' in script
-    assert "FINANCE_SESSION_HTTPS_ONLY=false" in script
-    assert "without TLS" in script
+    assert "FINANCE_SESSION_HTTPS_ONLY=true" in script
+    assert "without TLS" not in script
 
 
 def test_installer_relocks_existing_account_and_repairs_private_permissions() -> None:
