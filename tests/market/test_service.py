@@ -404,6 +404,100 @@ def test_refresh_with_fallback_does_not_accept_intraday_estimate_as_success():
         session.close()
 
 
+def test_estimate_fallback_requires_intraday_quote_type_and_skips_recalculation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session, _ = setup_session()
+    try:
+        official = StubProvider(
+            FundNavQuote(
+                value=Decimal("1.20"),
+                valuation_date=NOW.date(),
+                source="eastmoney",
+                source_url=SOURCE_URL,
+                fetched_at=NOW,
+                quote_type=QuoteType.OFFICIAL_NAV,
+            )
+        )
+        estimate = EfinanceStubProvider(
+            quote=FundNavQuote(
+                value=Decimal("1.23"),
+                valuation_date=NOW.date(),
+                source="efinance:estimate",
+                source_url="https://example.test/estimate",
+                fetched_at=NOW,
+                quote_type=QuoteType.INTRADAY_ESTIMATE,
+            )
+        )
+        recalculated = False
+
+        def mark_recalculated(*args, **kwargs):
+            nonlocal recalculated
+            recalculated = True
+
+        monkeypatch.setattr(
+            "finance_app.market.service.refresh_current_snapshot_after_price_update",
+            mark_recalculated,
+        )
+        result = FundPriceService(
+            session, official, clock=lambda: NOW
+        ).refresh_with_fallback(
+            "000001",
+            [official, estimate],
+            required_quote_type=QuoteType.INTRADAY_ESTIMATE,
+        )
+
+        assert result.status is RefreshStatus.SUCCESS
+        assert result.snapshot is not None
+        assert result.snapshot.quote_type == QuoteType.INTRADAY_ESTIMATE
+        assert result.snapshot.source == "efinance:estimate"
+        assert official.calls == ["000001"]
+        assert estimate.calls == ["000001"]
+        assert result.provider_attempts[0].status is RefreshStatus.FAILED
+        assert recalculated is False
+    finally:
+        session.close()
+
+
+def test_failed_estimate_refresh_returns_last_estimate_not_official_nav():
+    session, asset = setup_session()
+    try:
+        official = PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=NOW.date(),
+            price=Decimal("1.20"),
+            source="eastmoney",
+            source_url=SOURCE_URL,
+            quote_type=QuoteType.OFFICIAL_NAV,
+            fetched_at=NOW,
+        )
+        estimate = PriceSnapshot(
+            asset_id=asset.id,
+            valuation_date=NOW.date(),
+            price=Decimal("1.21"),
+            source="tiantian:estimate",
+            source_url="https://example.test/estimate",
+            quote_type=QuoteType.INTRADAY_ESTIMATE,
+            fetched_at=NOW,
+        )
+        session.add_all((official, estimate))
+        session.flush()
+        result = FundPriceService(
+            session,
+            StubProvider(error=RuntimeError("estimate unavailable")),
+            clock=lambda: NOW,
+        ).refresh(
+            "000001",
+            required_quote_type=QuoteType.INTRADAY_ESTIMATE,
+        )
+
+        assert result.status is RefreshStatus.FAILED
+        assert result.last_good_snapshot is estimate
+        assert result.last_good_price == Decimal("1.21000000")
+    finally:
+        session.close()
+
+
 def test_snapshot_recalculation_error_propagates_without_calling_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ):

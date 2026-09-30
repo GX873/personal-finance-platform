@@ -95,7 +95,8 @@ class FundPriceService:
                 error_summary=f"asset_not_found: fund asset {fund_code} was not found",
             )
 
-        last_good = self._last_good(asset.id)
+        requested_quote_type = required_quote_type or QuoteType.OFFICIAL_NAV
+        last_good = self._last_good(asset.id, requested_quote_type)
         try:
             quote = self._provider.fetch(fund_code)
         except Exception as error:  # noqa: BLE001 - provider fetch boundary
@@ -227,7 +228,11 @@ class FundPriceService:
         )
 
     def refresh_with_fallback(
-        self, fund_code: str, providers: list[FundNavProvider]
+        self,
+        fund_code: str,
+        providers: list[FundNavProvider],
+        *,
+        required_quote_type: QuoteType = QuoteType.OFFICIAL_NAV,
     ) -> RefreshResult:
         if not providers:
             raise ValueError("at least one NAV provider is required")
@@ -236,25 +241,24 @@ class FundPriceService:
         for provider in providers:
             result = FundPriceService(
                 self._session, provider, clock=self._clock
-            ).refresh(fund_code, required_quote_type=QuoteType.OFFICIAL_NAV)
-            official = (
+            ).refresh(fund_code, required_quote_type=required_quote_type)
+            matches = (
                 result.snapshot is not None
-                and result.snapshot.quote_type == QuoteType.OFFICIAL_NAV
+                and QuoteType(result.snapshot.quote_type) is required_quote_type
             )
-            attempt_status = result.status
-            attempt_error = (
-                result.error_summary
-                if result.status is RefreshStatus.FAILED
-                else None
-            )
-            if result.snapshot is not None and not official:
+            attempt_status = result.status if matches else RefreshStatus.FAILED
+            attempt_error = result.error_summary
+            if result.snapshot is not None and not matches:
                 attempt_status = RefreshStatus.FAILED
-                attempt_error = "provider returned a non-official NAV quote"
+                attempt_error = (
+                    f"provider returned {result.snapshot.quote_type}; "
+                    f"required {required_quote_type.value}"
+                )
             attempts.append(
                 ProviderAttempt(provider.source, attempt_status, attempt_error)
             )
             last_result = result
-            if result.status is RefreshStatus.SUCCESS and official:
+            if result.status is RefreshStatus.SUCCESS and matches:
                 return replace(result, provider_attempts=tuple(attempts))
         reference = self._clock()
         asset = self._session.scalar(
@@ -264,7 +268,9 @@ class FundPriceService:
                 Asset.asset_class == "fund",
             )
         )
-        last_good = self._last_good(asset.id) if asset is not None else None
+        last_good = (
+            self._last_good(asset.id, required_quote_type) if asset is not None else None
+        )
         if last_result is None:
             last_result = RefreshResult(
                 status=RefreshStatus.FAILED,
@@ -276,7 +282,9 @@ class FundPriceService:
                 source_url=providers[-1].source_url,
                 fetched_at=reference,
                 attempts=len(attempts),
-                error_summary="no fresh official NAV from configured providers",
+                error_summary=(
+                    f"no usable {required_quote_type.value} from configured providers"
+                ),
             )
         return replace(
             last_result,
@@ -285,17 +293,23 @@ class FundPriceService:
             snapshot=None,
             last_good_snapshot=last_good,
             last_good_price=last_good.price if last_good is not None else None,
-            error_summary="no fresh official NAV from configured providers",
+            error_summary=(
+                f"no usable {required_quote_type.value} from configured providers"
+            ),
             provider_attempts=tuple(attempts),
         )
 
-    def _last_good(self, asset_id: int) -> PriceSnapshot | None:
+    def _last_good(
+        self,
+        asset_id: int,
+        quote_type: QuoteType = QuoteType.OFFICIAL_NAV,
+    ) -> PriceSnapshot | None:
         rows = self._session.scalars(
             select(PriceSnapshot).where(
                 PriceSnapshot.asset_id == asset_id,
                 PriceSnapshot.error_text.is_(None),
                 PriceSnapshot.price > 0,
-                PriceSnapshot.quote_type == "official_nav",
+                PriceSnapshot.quote_type == quote_type.value,
             )
         )
         return max(rows, key=price_selection_key, default=None)
