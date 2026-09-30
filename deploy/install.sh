@@ -106,7 +106,8 @@ chown root:adm /var/log/personal-finance
 chmod 0750 /var/log/personal-finance
 
 for unit in finance-app.service finance-daily.service finance-daily.timer \
-    finance-backup.service finance-backup.timer; do
+    finance-backup.service finance-backup.timer finance-market.service \
+    finance-market.timer; do
     install -o root -g root -m 0644 "$SOURCE_DIR/deploy/$unit" \
         "/etc/systemd/system/$unit"
 done
@@ -125,6 +126,7 @@ systemctl daemon-reload
 systemctl enable finance-app.service finance-daily.timer finance-backup.timer
 systemctl enable nginx
 systemctl enable --now finance-daily.timer finance-backup.timer
+systemctl enable --now finance-market.timer
 systemctl reload-or-restart nginx
 
 cat <<'MESSAGE'

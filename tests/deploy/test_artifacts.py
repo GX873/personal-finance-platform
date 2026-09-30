@@ -41,6 +41,23 @@ def test_daily_timer_runs_every_five_minutes_and_consults_saved_schedule() -> No
     assert "User=financeapp" in service
 
 
+def test_market_timer_triggers_every_five_minutes_on_weekdays() -> None:
+    timer = read("finance-market.timer")
+    service = read("finance-market.service")
+    assert "OnCalendar=Mon..Fri *-*-* 09..15:00/5:00" in timer
+    assert "Persistent=false" in timer
+    assert "finance market-refresh --scheduled" in service
+    assert "User=financeapp" in service
+    assert "MemoryMax=300M" in service
+
+
+def test_installer_enables_market_timer() -> None:
+    script = read("install.sh")
+    assert "finance-market.service" in script
+    assert "finance-market.timer" in script
+    assert "systemctl enable --now finance-market.timer" in script
+
+
 def test_backup_timer_runs_online_backup_as_locked_user() -> None:
     timer = read("finance-backup.timer")
     service = read("finance-backup.service")
