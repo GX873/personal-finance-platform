@@ -14,7 +14,7 @@
   {% for key,label,url,icon in [
     ('dashboard','资产总览','/','◈'),('holdings','我的持仓','/holdings','▤'),
     ('transactions','收支流水','/transactions','⇄'),('accounts','账户与基金','/accounts','▦'),
-    ('prices','手工净值','/prices/new','◇'),('analysis','投资分析','/analysis','↗'),
+    ('prices','基金数据','/funds','◇'),('analysis','投资分析','/analysis','↗'),
     ('alerts','提醒中心','/alerts','○'),('backups','备份与导出','/backups','↻'),('imports','数据导入',none,'↓'),('settings','偏好设置','/settings','⚙')
   ] %}
     {% if url and not demo %}<a class="nav-item {{ 'active' if section == key }}" href="{{ url }}" {% if section == key %}aria-current="page"{% endif %}><span aria-hidden="true">{{ icon }}</span>{{ label }}</a>
@@ -31,5 +31,5 @@
   {% block content %}{% endblock %}
   <footer>有数 · 每一份确定，都来自真实记录。<span>金额单位：人民币元 · Asia/Shanghai</span></footer>
 </main>
-<nav class="mobile-nav" aria-label="移动导航"><a href="{{ '/preview' if demo else '/' }}" {{ 'aria-current=page' if section == 'dashboard' }}>◈<span>总览</span></a>{% if not demo %}<a href="/transactions" {{ 'aria-current=page' if section == 'transactions' }}>⇄<span>流水</span></a><a href="/accounts" {{ 'aria-current=page' if section == 'accounts' }}>▦<span>账户</span></a><a href="/prices/new" {{ 'aria-current=page' if section == 'prices' }}>◇<span>净值</span></a><a href="/alerts" {{ 'aria-current=page' if section == 'alerts' }}>○<span>提醒</span></a>{% else %}<a href="/login">↗<span>登录</span></a>{% endif %}</nav>
+<nav class="mobile-nav" aria-label="移动导航"><a href="{{ '/preview' if demo else '/' }}" {{ 'aria-current=page' if section == 'dashboard' }}>◈<span>总览</span></a>{% if not demo %}<a href="/transactions" {{ 'aria-current=page' if section == 'transactions' }}>⇄<span>流水</span></a><a href="/accounts" {{ 'aria-current=page' if section == 'accounts' }}>▦<span>账户</span></a><a href="/funds" {{ 'aria-current=page' if section == 'prices' }}>◇<span>基金</span></a><a href="/alerts" {{ 'aria-current=page' if section == 'alerts' }}>○<span>提醒</span></a>{% else %}<a href="/login">↗<span>登录</span></a>{% endif %}</nav>
 </body></html>

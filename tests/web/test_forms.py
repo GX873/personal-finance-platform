@@ -377,12 +377,12 @@ def test_transaction_time_formatter_explicitly_uses_shanghai_timezone():
     assert web_routes.shanghai_datetime(timestamp) == "2026-09-23 15:30"
 
 
-def test_mobile_navigation_links_manual_price_entry(client):
+def test_mobile_navigation_links_fund_data_center(client):
     assert login(client).status_code == 303
     page = client.get("/")
     mobile_nav = page.text.split('class="mobile-nav"', 1)[1].split("</nav>", 1)[0]
-    assert 'href="/prices/new"' in mobile_nav
-    assert "净值" in mobile_nav
+    assert 'href="/funds"' in mobile_nav
+    assert "基金" in mobile_nav
 
 
 def test_mobile_navigation_uses_five_shrinkable_equal_columns():
@@ -830,6 +830,125 @@ def test_price_pages_use_manual_fund_context(client, db_session, monkeypatch):
     assert client.get("/prices/new").status_code == 200
     assert client.get(f"/prices/{snapshot.id}/edit").status_code == 200
     assert calls == [None, asset.id]
+
+
+def test_fund_center_renders_four_fund_only_views(client, db_session, monkeypatch):
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=UTC)
+    monkeypatch.setattr(web_routes, "utc_now", lambda: now)
+    asset = add_held_fund(db_session)
+    db_session.add_all(
+        [
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 8, 30),
+                price=Decimal("1.00"),
+                source="efinance",
+                source_url="https://example.test/history",
+                fetched_at=datetime(2026, 8, 30, 8, tzinfo=UTC),
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 9, 29),
+                price=Decimal("1.20"),
+                source="eastmoney",
+                source_url="https://example.test/nav",
+                fetched_at=datetime(2026, 9, 29, 8, tzinfo=UTC),
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 9, 30),
+                price=Decimal("1.23"),
+                source="tiantian:estimate",
+                source_url="https://example.test/estimate",
+                fetched_at=now,
+                quote_type=QuoteType.INTRADAY_ESTIMATE.value,
+            ),
+        ]
+    )
+    db_session.commit()
+    assert login(client).status_code == 303
+
+    quotes = client.get(f"/funds?asset_id={asset.id}&period=1y")
+    risk = client.get(f"/funds?tab=risk&asset_id={asset.id}&period=1y")
+    holdings = client.get(
+        f"/funds?tab=holdings&asset_id={asset.id}&period=1y"
+    )
+
+    assert quotes.status_code == risk.status_code == holdings.status_code == 200
+    for label in ("行情", "风险分析", "持仓跟踪", "手工净值"):
+        assert label in quotes.text
+    assert 'data-active-tab="quotes"' in quotes.text
+    assert "正式净值" in quotes.text
+    assert "盘中估值" in quotes.text
+    assert "数据来源" in quotes.text
+    assert 'viewBox="0 0 600 220"' in quotes.text
+    assert f'action="/funds/{asset.id}/refresh"' in quotes.text
+    assert 'name="csrf_token"' in form_markup(
+        quotes.text, f"/funds/{asset.id}/refresh"
+    )
+    for period in ("1m", "3m", "6m", "1y", "all"):
+        assert f"period={period}" in quotes.text
+    assert "区间收益率" in risk.text
+    assert "最大回撤" in risk.text
+    assert "年化波动率" in risk.text
+    assert "风险等级" in risk.text
+    assert "组合占比" in holdings.text
+    assert "持仓收益率" in holdings.text
+    assert "盘中估算盈亏" in holdings.text
+    for forbidden in ("重仓股", "股票", "确认陈旧"):
+        assert forbidden not in quotes.text + risk.text + holdings.text
+
+
+def test_fund_center_missing_metrics_and_refresh_result_are_compact(
+    client, db_session
+):
+    asset = add_held_fund(db_session)
+    assert login(client).status_code == 303
+
+    missing = client.get(f"/funds?tab=risk&asset_id={asset.id}")
+    refreshed = client.get(f"/funds?asset_id={asset.id}&refresh=cooldown")
+
+    assert missing.text.count("暂无数据") >= 4
+    assert 'role="status"' in refreshed.text
+    assert "刷新过于频繁" in refreshed.text
+
+
+def test_manual_tab_has_quick_summary_edit_and_delete_controls(client, db_session):
+    asset = add_held_fund(db_session)
+    row = PriceSnapshot(
+        asset_id=asset.id,
+        valuation_date=date(2026, 9, 29),
+        price=Decimal("1.2"),
+        source="manual:statement",
+        fetched_at=datetime(2026, 9, 29, 8, tzinfo=UTC),
+    )
+    db_session.add(row)
+    db_session.commit()
+    assert login(client).status_code == 303
+
+    response = client.get(f"/prices/{row.id}/edit")
+
+    assert response.status_code == 200
+    assert 'data-active-tab="manual"' in response.text
+    assert "当前基金摘要" in response.text
+    assert f'href="/prices/{row.id}/edit"' in response.text
+    delete_form = form_markup(response.text, f"/prices/{row.id}/delete")
+    assert 'name="csrf_token"' in delete_form
+    assert "confirm('确认删除这条手工净值？')" in delete_form
+
+
+def test_fund_center_css_has_stable_responsive_layout():
+    css = Path("finance_app/static/forms.css").read_text(encoding="utf-8")
+
+    assert ".fund-center-grid" in css
+    assert "grid-template-columns:minmax(12rem,18rem) minmax(0,1fr)" in css
+    assert ".fund-chart" in css
+    assert "aspect-ratio:30/11" in css
+    assert ".fund-metrics" in css
+    assert "repeat(3,minmax(0,1fr))" in css
+    mobile_css = css.split("@media(max-width:760px)", 1)[1]
+    assert ".fund-center-grid,.fund-metrics{grid-template-columns:1fr}" in mobile_css
+    assert ".fund-tabs{overflow-x:auto}" in mobile_css
 
 
 def test_manual_intraday_refresh_is_cooled_down_and_audited(
