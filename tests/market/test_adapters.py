@@ -75,3 +75,9 @@ def test_xalpha_boundary_calculates_return_drawdown_and_volatility():
     assert analytics.total_return() == Decimal("0.1")
     assert analytics.max_drawdown() == Decimal("-0.25")
     assert analytics.volatility() > 0
+
+
+def test_xalpha_boundary_annualizes_sample_daily_volatility():
+    analytics = XalphaAdapter([Decimal(1), Decimal("1.01"), Decimal("1.02")])
+    daily = analytics.volatility() / Decimal(252).sqrt()
+    assert daily > 0

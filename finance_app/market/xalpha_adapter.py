@@ -12,12 +12,14 @@ class XalphaAdapter:
         if not self.values or any(value <= 0 for value in self.values):
             raise ValueError("NAV history must contain positive values")
 
-    def total_return(self) -> Decimal:
+    def total_return(self) -> Decimal | None:
         if len(self.values) < 2:
-            return Decimal(0)
+            return None
         return self.values[-1] / self.values[0] - Decimal(1)
 
-    def max_drawdown(self) -> Decimal:
+    def max_drawdown(self) -> Decimal | None:
+        if len(self.values) < 2:
+            return None
         peak = self.values[0]
         worst = Decimal(0)
         for value in self.values:
@@ -25,9 +27,9 @@ class XalphaAdapter:
             worst = min(worst, value / peak - Decimal(1))
         return worst
 
-    def volatility(self) -> Decimal:
+    def volatility(self) -> Decimal | None:
         if len(self.values) < 3:
-            return Decimal(0)
+            return None
         returns = [
             self.values[index] / self.values[index - 1] - 1
             for index in range(1, len(self.values))
@@ -36,4 +38,4 @@ class XalphaAdapter:
         variance = sum((value - mean) ** 2 for value in returns) / (
             len(returns) - 1
         )
-        return Decimal(variance).sqrt()
+        return Decimal(variance).sqrt() * Decimal(252).sqrt()
