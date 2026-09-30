@@ -418,6 +418,7 @@ class DailyCheck:
                     PriceSnapshot.asset_id == asset.id,
                     PriceSnapshot.valuation_date == quote.valuation_date,
                     PriceSnapshot.source == quote.source,
+                    PriceSnapshot.quote_type == quote.quote_type,
                 )
             )
             if existing is not None:

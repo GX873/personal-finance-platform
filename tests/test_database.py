@@ -75,6 +75,63 @@ def test_initial_revision_matches_current_model_schema(db_session: Session):
     command.check(Config("alembic.ini"))
 
 
+def test_quote_type_migration_preserves_old_snapshots_and_allows_intraday_duplicate(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    database_url = f"sqlite:///{tmp_path / 'quote-migration.db'}"
+    monkeypatch.setenv("FINANCE_DATABASE_URL", database_url)
+    from finance_app.config import get_settings
+
+    get_settings.cache_clear()
+    reset_database_state()
+    config = Config("alembic.ini")
+    command.upgrade(config, "0004")
+    engine = create_db_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO assets "
+                    "(id, code, market, name, asset_class, risk_level, "
+                    "portfolio_role, currency, created_at, updated_at) "
+                    "VALUES (1, '000001', 'CN', 'Fund', 'fund', 'medium', "
+                    "'core', 'CNY', '2026-01-01', '2026-01-01')"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO price_snapshots "
+                    "(id, asset_id, valuation_date, source, price, quote_type, "
+                    "fetched_at) VALUES (1, 1, '2026-09-29', 'eastmoney', "
+                    "1.25000000, 'official_nav', '2026-09-29 00:00:00')"
+                )
+            )
+        command.upgrade(config, "head")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO price_snapshots "
+                    "(asset_id, valuation_date, source, price, quote_type, "
+                    "fetched_at) VALUES (1, '2026-09-29', 'eastmoney', "
+                    "1.30000000, 'intraday_estimate', '2026-09-29 01:00:00')"
+                )
+            )
+            values = connection.execute(
+                text(
+                    "SELECT id, quote_type, price FROM price_snapshots "
+                    "ORDER BY id"
+                )
+            ).all()
+        assert values == [
+            (1, "official_nav", 1.25),
+            (2, "intraday_estimate", 1.3),
+        ]
+    finally:
+        engine.dispose()
+        reset_database_state()
+        get_settings.cache_clear()
+
+
 @pytest.mark.parametrize(
     "month", ["2026-00", "2026-13", "2026-19", "2026-1", "202x-12"]
 )
@@ -312,6 +369,7 @@ def test_metadata_includes_initial_migration_tables_and_constraints(
             "opportunity_alerts",
         "portfolio_snapshots",
         "price_snapshots",
+        "fund_refresh_claims",
         "transactions",
         "users",
     }
@@ -323,5 +381,5 @@ def test_metadata_includes_initial_migration_tables_and_constraints(
     assert PriceSnapshot.__table__.c.price.type.scale == 8
     assert (
         db_session.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        == "0004"
+        == "0005"
     )

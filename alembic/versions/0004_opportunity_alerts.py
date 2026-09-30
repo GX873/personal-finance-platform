@@ -1,6 +1,7 @@
 """Record opportunity alerts once per fund and salary cycle."""
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0004"

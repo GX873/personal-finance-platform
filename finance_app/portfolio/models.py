@@ -55,6 +55,9 @@ class PriceSnapshot(Base):
             "asset_id",
             "valuation_date",
             "source",
+            "quote_type",
+            # Keep the historical constraint name for operational compatibility;
+            # quote_type is now part of the identity.
             name="uq_price_snapshots_asset_valuation_source",
         ),
     )
@@ -74,6 +77,21 @@ class PriceSnapshot(Base):
         UtcDateTime(), default=utc_now, nullable=False
     )
     error_text: Mapped[str | None] = mapped_column(Text)
+
+
+class FundRefreshClaim(Base):
+    """Durable per-fund claim used to serialize manual refresh attempts."""
+
+    __tablename__ = "fund_refresh_claims"
+    __table_args__ = (
+        UniqueConstraint("asset_id", name="uq_fund_refresh_claims_asset"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    asset_id: Mapped[int] = mapped_column(
+        ForeignKey("assets.id", ondelete="CASCADE"), nullable=False
+    )
+    claimed_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
 
 
 class PortfolioSnapshot(Base):

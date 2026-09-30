@@ -790,6 +790,44 @@ def test_refresh_uses_the_cn_asset_when_another_market_has_the_same_code():
         assert result.snapshot.asset_id == cn.id
 
 
+def test_official_and_intraday_snapshots_with_same_source_and_date_are_isolated():
+    session, asset = setup_session()
+    try:
+        official = quote()
+        intraday = FundNavQuote(
+            value=Decimal("1.2500"),
+            valuation_date=official.valuation_date,
+            source=official.source,
+            source_url=official.source_url,
+            fetched_at=NOW,
+            quote_type=QuoteType.INTRADAY_ESTIMATE,
+        )
+        official_result = FundPriceService(
+            session, StubProvider(official), clock=lambda: NOW
+        ).refresh("000001", required_quote_type=QuoteType.OFFICIAL_NAV)
+        intraday_result = FundPriceService(
+            session, StubProvider(intraday), clock=lambda: NOW
+        ).refresh("000001", required_quote_type=QuoteType.INTRADAY_ESTIMATE)
+
+        assert official_result.snapshot is not None
+        assert intraday_result.snapshot is not None
+        rows = list(
+            session.scalars(
+                select(PriceSnapshot).where(PriceSnapshot.asset_id == asset.id)
+            )
+        )
+        assert {row.quote_type for row in rows} == {
+            QuoteType.OFFICIAL_NAV.value,
+            QuoteType.INTRADAY_ESTIMATE.value,
+        }
+        official_row = next(
+            row for row in rows if row.quote_type == QuoteType.OFFICIAL_NAV.value
+        )
+        assert official_row.price == Decimal("1.23450000")
+    finally:
+        session.close()
+
+
 def test_non_cn_fund_is_not_sent_to_the_cn_only_provider():
     engine = create_db_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)

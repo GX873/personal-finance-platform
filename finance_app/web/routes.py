@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -44,6 +44,7 @@ from finance_app.ops.backup import backup_directory, recent_backup_statuses
 from finance_app.portfolio.models import (
     Alert,
     AllocationTarget,
+    FundRefreshClaim,
     PortfolioSnapshot,
     PriceSnapshot,
 )
@@ -362,6 +363,39 @@ def _manual_refresh_allowed(
         .limit(1)
     )
     return recent is None
+
+
+def _claim_manual_refresh(
+    db: Session,
+    asset_id: int,
+    now: datetime,
+    *,
+    cooldown_seconds: int = _MANUAL_REFRESH_COOLDOWN_SECONDS,
+) -> bool:
+    """Atomically claim the cooldown before making an upstream request.
+
+    The claim is committed independently so provider failures still consume the
+    cooldown. A unique asset row makes the insert race-safe on SQLite/Postgres.
+    """
+    cutoff = now - timedelta(seconds=cooldown_seconds)
+    updated = db.execute(
+        update(FundRefreshClaim)
+        .where(
+            FundRefreshClaim.asset_id == asset_id,
+            FundRefreshClaim.claimed_at <= cutoff,
+        )
+        .values(claimed_at=now)
+    )
+    if updated.rowcount:
+        db.commit()
+        return True
+    try:
+        db.add(FundRefreshClaim(asset_id=asset_id, claimed_at=now))
+        db.commit()
+        return True
+    except IntegrityError:
+        db.rollback()
+        return False
 
 
 def _refresh_audit_event(
@@ -951,7 +985,7 @@ def refresh_fund_estimate(
 ):
     asset = _require_held_cn_fund(db, asset_id)
     attempted_at = utc_now()
-    if not _manual_refresh_allowed(db, asset.id, attempted_at):
+    if not _claim_manual_refresh(db, asset.id, attempted_at):
         return RedirectResponse(
             f"/funds?asset_id={asset.id}&refresh=cooldown", status_code=303
         )
@@ -1003,6 +1037,7 @@ async def create_price(
                 PriceSnapshot.asset_id == asset_id,
                 PriceSnapshot.valuation_date == valuation_date,
                 PriceSnapshot.source == source,
+                PriceSnapshot.quote_type == QuoteType.OFFICIAL_NAV.value,
             )
         )
         if existing is not None:
@@ -1076,6 +1111,7 @@ async def update_price(
                 PriceSnapshot.asset_id == asset_id,
                 PriceSnapshot.valuation_date == valuation_date,
                 PriceSnapshot.source == source,
+                PriceSnapshot.quote_type == QuoteType.OFFICIAL_NAV.value,
                 PriceSnapshot.id != snapshot.id,
             )
         )
