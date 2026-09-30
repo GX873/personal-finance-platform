@@ -32,8 +32,13 @@ from finance_app.ledger.models import (
 )
 from finance_app.market.base import FundNavProvider
 from finance_app.market.eastmoney import EastMoneyFundNavProvider
-from finance_app.market.efinance_adapter import EfinanceAdapter
+from finance_app.market.efinance_adapter import (
+    EfinanceAdapter,
+    EfinanceEstimateAdapter,
+)
+from finance_app.market.intraday_job import IntradayRefreshJob
 from finance_app.market.service import FundPriceService, RefreshResult, RefreshStatus
+from finance_app.market.tiantian_estimate import TiantianEstimateProvider
 from finance_app.notifications.base import DeliveryStatus, Notification
 from finance_app.notifications.email import EmailNotifier
 from finance_app.notifications.models import (
@@ -1194,6 +1199,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--date", type=_iso_date)
     mode.add_argument("--scheduled", action="store_true")
     daily.add_argument("--dry-run", action="store_true")
+    market = commands.add_parser("market-refresh")
+    market.add_argument("--scheduled", action="store_true", required=True)
     backup = commands.add_parser("backup")
     backup.add_argument("--directory", default=None)
     backup.add_argument("--keep", type=int, default=14)
@@ -1232,6 +1239,30 @@ def main(argv: list[str] | None = None) -> int:
         for path in export_paths.values():
             print(path)
         return 0
+    if args.command == "market-refresh":
+        primary = None
+        try:
+            with get_session_factory()() as db:
+                primary = TiantianEstimateProvider()
+                fallback = EfinanceEstimateAdapter()
+                market_result = IntradayRefreshJob(
+                    db, providers=[primary, fallback]
+                ).run_scheduled()
+        except Exception:  # noqa: BLE001 - sanitize the CLI boundary
+            print(
+                "market-refresh status=failed error=internal_error",
+                file=sys.stderr,
+            )
+            return 1
+        finally:
+            if primary is not None:
+                primary.close()
+        print(
+            f"market-refresh status={market_result.status} "
+            f"attempted={market_result.attempted} "
+            f"succeeded={market_result.succeeded} failed={market_result.failed}"
+        )
+        return 1 if market_result.status == "failed" else 0
     if args.command != "daily-check":
         return _password_command(args)
     with get_session_factory()() as db:
