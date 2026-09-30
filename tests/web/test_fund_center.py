@@ -245,6 +245,31 @@ def test_fund_center_uses_official_nav_for_value_and_estimate_only_for_preview(
 
 def test_fund_center_never_substitutes_missing_values_with_zero(db_session: Session):
     asset = seed_holding_without_prices(db_session)
+    account_id = db_session.query(Holding.account_id).scalar()
+    priced_asset = Asset(
+        code="000011",
+        market="CN",
+        name="已有净值基金",
+        asset_class="fund",
+        currency="CNY",
+    )
+    db_session.add(priced_asset)
+    db_session.flush()
+    db_session.add(
+        Holding(
+            account_id=account_id,
+            asset_id=priced_asset.id,
+            quantity=Decimal(10),
+            cost_cents=1_000,
+        )
+    )
+    add_price(
+        db_session,
+        priced_asset,
+        value="1.10",
+        valuation_date=date(2026, 9, 29),
+    )
+    db_session.commit()
 
     vm = build_fund_center(
         db_session, selected_asset_id=asset.id, period="1y", now=NOW
@@ -257,6 +282,7 @@ def test_fund_center_never_substitutes_missing_values_with_zero(db_session: Sess
     assert vm["selected"]["holding_return"] is None
     assert vm["metrics"]["total_return"] is None
     assert vm["chart"]["points"] == []
+    assert all(row["portfolio_percent"] is None for row in vm["funds"])
 
 
 def test_history_and_metrics_ignore_intraday_rows_and_apply_period_cutoff(

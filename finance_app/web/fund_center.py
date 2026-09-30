@@ -58,11 +58,16 @@ def build_fund_center(
         for row in rows
         if isinstance(row["official_value_cents"], int)
     )
+    values_complete = all(
+        row["official_value_cents"] is not None for row in rows
+    )
     for row in rows:
         official_value = row["official_value_cents"]
         row["portfolio_percent"] = (
             _ratio(official_value, known_total_cents)
-            if isinstance(official_value, int) and known_total_cents > 0
+            if values_complete
+            and isinstance(official_value, int)
+            and known_total_cents > 0
             else None
         )
     rows.sort(
