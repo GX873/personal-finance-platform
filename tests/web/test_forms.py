@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,6 +25,7 @@ from finance_app.ledger.models import (
     Holding,
     Transaction,
 )
+from finance_app.market.base import FundNavQuote, QuoteType
 from finance_app.portfolio.models import Alert, PortfolioSnapshot, PriceSnapshot
 from finance_app.portfolio.service import create_daily_snapshot
 from finance_app.web import routes as web_routes
@@ -105,6 +106,34 @@ def add_account(db_session, *, opening_balance_cents: int = 100_000) -> Account:
 def add_asset(db_session) -> Asset:
     asset = Asset(code="000001", market="CN", name="测试基金")
     db_session.add(asset)
+    db_session.commit()
+    return asset
+
+
+def add_held_fund(db_session: Session) -> Asset:
+    account = Account(
+        name="fund-account",
+        kind="investment",
+        currency="CNY",
+        opening_balance_cents=0,
+    )
+    asset = Asset(
+        code="000001",
+        market="CN",
+        name="held-fund",
+        asset_class="fund",
+        currency="CNY",
+    )
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add(
+        Holding(
+            account_id=account.id,
+            asset_id=asset.id,
+            quantity=Decimal(10),
+            cost_cents=1_000,
+        )
+    )
     db_session.commit()
     return asset
 
@@ -714,3 +743,377 @@ def test_mark_alert_read_is_csrf_protected_audited_and_idempotent(client, db_ses
     assert client.post(
         "/alerts/999999/read", data={"csrf_token": token}
     ).status_code == 404
+
+
+def test_fund_center_requires_login_and_reads_only_local_data(
+    client, db_session, monkeypatch
+):
+    asset = add_held_fund(db_session)
+    calls: list[tuple[int | None, str]] = []
+
+    def fake_build(db, *, selected_asset_id, period, now):
+        assert db is not None
+        assert now.tzinfo is not None
+        calls.append((selected_asset_id, period))
+        return {"selected": {"asset_id": selected_asset_id}, "funds": []}
+
+    def external_call_is_a_bug(*args, **kwargs):
+        raise AssertionError("GET /funds must not construct an external provider")
+
+    monkeypatch.setattr(web_routes, "build_fund_center", fake_build)
+    monkeypatch.setattr(web_routes, "TiantianEstimateProvider", external_call_is_a_bug)
+    monkeypatch.setattr(web_routes, "EfinanceEstimateAdapter", external_call_is_a_bug)
+
+    response = client.get("/funds")
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+    assert login(client).status_code == 303
+    response = client.get(f"/funds?tab=risk&asset_id={asset.id}&period=3m")
+    assert response.status_code == 200
+    assert calls == [(asset.id, "3m")]
+
+
+def test_fund_center_invalid_tab_and_period_fall_back_to_defaults(
+    client, db_session, monkeypatch
+):
+    add_held_fund(db_session)
+    captured: dict[str, object] = {}
+
+    def fake_build(db, *, selected_asset_id, period, now):
+        captured["period"] = period
+        return {"selected": {"asset_id": None}, "funds": []}
+
+    original_response = web_routes.templates.TemplateResponse
+
+    def capture_response(*, request, name, context, status_code=200):
+        if "fund_tab" in context:
+            captured["name"] = name
+            captured["tab"] = context["fund_tab"]
+        return original_response(
+            request=request, name=name, context=context, status_code=status_code
+        )
+
+    monkeypatch.setattr(web_routes, "build_fund_center", fake_build)
+    monkeypatch.setattr(web_routes.templates, "TemplateResponse", capture_response)
+    assert login(client).status_code == 303
+
+    response = client.get("/funds?tab=invalid&period=invalid")
+
+    assert response.status_code == 200
+    assert captured == {
+        "period": "1y",
+        "name": "price_form.html",
+        "tab": "quotes",
+    }
+
+
+def test_price_pages_use_manual_fund_context(client, db_session, monkeypatch):
+    asset = add_held_fund(db_session)
+    snapshot = PriceSnapshot(
+        asset_id=asset.id,
+        valuation_date=date(2026, 9, 29),
+        price=Decimal("1.1"),
+        source="manual:user-entry",
+        fetched_at=datetime(2026, 9, 29, 8, tzinfo=UTC),
+    )
+    db_session.add(snapshot)
+    db_session.commit()
+    calls: list[int | None] = []
+
+    def fake_build(db, *, selected_asset_id, period, now):
+        calls.append(selected_asset_id)
+        return {"selected": {"asset_id": selected_asset_id}, "funds": []}
+
+    monkeypatch.setattr(web_routes, "build_fund_center", fake_build)
+    assert login(client).status_code == 303
+
+    assert client.get("/prices/new").status_code == 200
+    assert client.get(f"/prices/{snapshot.id}/edit").status_code == 200
+    assert calls == [None, asset.id]
+
+
+def test_manual_intraday_refresh_is_cooled_down_and_audited(
+    client, db_session, monkeypatch
+):
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=UTC)
+    asset = add_held_fund(db_session)
+    provider_calls: list[str] = []
+    closed: list[bool] = []
+
+    class Primary:
+        source = "tiantian:estimate"
+        source_url = "https://fundgz.1234567.com.cn/"
+
+        def __init__(self, *, clock):
+            self.clock = clock
+
+        def fetch(self, code):
+            provider_calls.append(code)
+            return FundNavQuote(
+                value=Decimal("1.23"),
+                valuation_date=now.astimezone(web_routes.SHANGHAI).date(),
+                source=self.source,
+                source_url=self.source_url,
+                fetched_at=now,
+                quote_type=QuoteType.INTRADAY_ESTIMATE,
+            )
+
+        def close(self):
+            closed.append(True)
+
+    class Fallback:
+        source = "efinance:estimate"
+        source_url = "https://example.test/efinance"
+
+        def __init__(self, *, clock):
+            self.clock = clock
+
+        def fetch(self, code):
+            raise AssertionError("fallback must not run after primary success")
+
+    monkeypatch.setattr(web_routes, "utc_now", lambda: now)
+    monkeypatch.setattr(web_routes, "TiantianEstimateProvider", Primary)
+    monkeypatch.setattr(web_routes, "EfinanceEstimateAdapter", Fallback)
+    assert login(client).status_code == 303
+    token = csrf(client, f"/funds?asset_id={asset.id}")
+
+    first = client.post(
+        f"/funds/{asset.id}/refresh", data={"csrf_token": token}
+    )
+    second = client.post(
+        f"/funds/{asset.id}/refresh", data={"csrf_token": token}
+    )
+
+    assert first.status_code == 303
+    assert first.headers["location"] == f"/funds?asset_id={asset.id}&refresh=success"
+    assert second.status_code == 303
+    assert second.headers["location"] == f"/funds?asset_id={asset.id}&refresh=cooldown"
+    assert provider_calls == [asset.code]
+    assert closed == [True]
+    db_session.expire_all()
+    estimate = db_session.scalar(
+        select(PriceSnapshot).where(
+            PriceSnapshot.quote_type == QuoteType.INTRADAY_ESTIMATE.value
+        )
+    )
+    assert estimate is not None
+    events = list(
+        db_session.scalars(
+            select(AuditEvent).where(AuditEvent.event_type == "fund.refresh_requested")
+        )
+    )
+    assert len(events) == 1
+    details = json.loads(events[0].details_json)
+    assert details["summary"] == {
+        "status": "success",
+        "source": "tiantian:estimate",
+        "attempts": 1,
+        "error": None,
+    }
+
+
+def test_failed_manual_refresh_uses_fallback_and_still_activates_cooldown(
+    client, db_session, monkeypatch
+):
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=UTC)
+    asset = add_held_fund(db_session)
+    provider_calls: list[str] = []
+    closed: list[bool] = []
+
+    class Primary:
+        source = "tiantian:estimate"
+        source_url = "https://fundgz.1234567.com.cn/"
+
+        def __init__(self, *, clock):
+            pass
+
+        def fetch(self, code):
+            provider_calls.append("primary")
+            raise RuntimeError("upstream private body must not be audited")
+
+        def close(self):
+            closed.append(True)
+
+    class Fallback:
+        source = "efinance:estimate"
+        source_url = "https://example.test/efinance"
+
+        def __init__(self, *, clock):
+            pass
+
+        def fetch(self, code):
+            provider_calls.append("fallback")
+            raise RuntimeError("fallback private body must not be audited")
+
+    monkeypatch.setattr(web_routes, "utc_now", lambda: now)
+    monkeypatch.setattr(web_routes, "TiantianEstimateProvider", Primary)
+    monkeypatch.setattr(web_routes, "EfinanceEstimateAdapter", Fallback)
+    assert login(client).status_code == 303
+    token = csrf(client, f"/funds?asset_id={asset.id}")
+
+    first = client.post(
+        f"/funds/{asset.id}/refresh", data={"csrf_token": token}
+    )
+    second = client.post(
+        f"/funds/{asset.id}/refresh", data={"csrf_token": token}
+    )
+
+    assert first.headers["location"] == f"/funds?asset_id={asset.id}&refresh=failed"
+    assert second.headers["location"] == f"/funds?asset_id={asset.id}&refresh=cooldown"
+    assert provider_calls == ["primary", "fallback"]
+    assert closed == [True]
+    event = db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "fund.refresh_requested")
+    )
+    assert event is not None
+    details = json.loads(event.details_json)
+    assert details["summary"]["status"] == "failed"
+    assert details["summary"]["error"] == "estimate_unavailable"
+    assert "private body" not in event.details_json
+
+
+@pytest.mark.parametrize(
+    ("market", "asset_class", "quantity"),
+    [("HK", "fund", "1"), ("CN", "stock", "1"), ("CN", "fund", "0")],
+)
+def test_manual_refresh_requires_currently_held_cn_fund(
+    client, db_session, monkeypatch, market, asset_class, quantity
+):
+    account = Account(name="account", kind="investment", currency="CNY")
+    asset = Asset(
+        code="000001",
+        market=market,
+        name="not-eligible",
+        asset_class=asset_class,
+        currency="CNY",
+    )
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add(
+        Holding(
+            account_id=account.id,
+            asset_id=asset.id,
+            quantity=Decimal(quantity),
+            cost_cents=100,
+        )
+    )
+    db_session.commit()
+    monkeypatch.setattr(
+        web_routes,
+        "TiantianEstimateProvider",
+        lambda **kwargs: pytest.fail("provider must not be constructed"),
+    )
+    assert login(client).status_code == 303
+
+    response = client.post(
+        f"/funds/{asset.id}/refresh",
+        data={"csrf_token": csrf(client, "/prices/new")},
+    )
+
+    assert response.status_code == 404
+
+
+def test_manual_price_delete_is_csrf_protected_manual_only_and_audited(
+    client, db_session
+):
+    asset = add_asset(db_session)
+    manual = PriceSnapshot(
+        asset_id=asset.id,
+        valuation_date=date(2026, 9, 28),
+        price=Decimal("1.23456789"),
+        source="manual:statement",
+        fetched_at=datetime(2026, 9, 28, 8, tzinfo=UTC),
+    )
+    automatic = PriceSnapshot(
+        asset_id=asset.id,
+        valuation_date=date(2026, 9, 29),
+        price=Decimal("1.25"),
+        source="eastmoney",
+        fetched_at=datetime(2026, 9, 29, 8, tzinfo=UTC),
+    )
+    db_session.add_all([manual, automatic])
+    db_session.commit()
+    manual_id = manual.id
+    automatic_id = automatic.id
+    assert login(client).status_code == 303
+
+    assert client.post(f"/prices/{manual_id}/delete").status_code == 403
+    token = csrf(client, "/prices/new")
+    assert client.post(
+        f"/prices/{automatic_id}/delete", data={"csrf_token": token}
+    ).status_code == 403
+    response = client.post(
+        f"/prices/{manual_id}/delete", data={"csrf_token": token}
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/prices/new"
+    db_session.expire_all()
+    assert db_session.get(PriceSnapshot, manual_id) is None
+    assert db_session.get(PriceSnapshot, automatic_id) is not None
+    event = db_session.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "price.deleted")
+    )
+    assert event is not None
+    details = json.loads(event.details_json)
+    assert details["summary"] == {
+        "old": {
+            "asset_id": asset.id,
+            "valuation_date": "2026-09-28",
+            "price": "1.23456789",
+            "source": "manual:statement",
+        }
+    }
+    assert client.post(
+        "/prices/999999/delete", data={"csrf_token": token}
+    ).status_code == 404
+
+
+def test_deleting_current_manual_nav_refreshes_portfolio_snapshot(
+    client, db_session, monkeypatch
+):
+    now = datetime(2026, 9, 30, 4, 0, tzinfo=UTC)
+    monkeypatch.setattr(web_routes, "utc_now", lambda: now)
+    account = add_account(db_session, opening_balance_cents=1_000)
+    asset = add_asset(db_session)
+    asset.asset_class = "fund"
+    db_session.add(
+        Holding(
+            account_id=account.id,
+            asset_id=asset.id,
+            quantity=Decimal(10),
+            cost_cents=1_000,
+        )
+    )
+    db_session.add(CashBucket(bucket_kind="reserve", balance_cents=100_000))
+    price = PriceSnapshot(
+        asset_id=asset.id,
+        valuation_date=now.astimezone(web_routes.SHANGHAI).date(),
+        price=Decimal(2),
+        source="manual:statement",
+        fetched_at=now,
+    )
+    db_session.add(price)
+    db_session.flush()
+    create_daily_snapshot(
+        db_session,
+        now=now,
+        holdings_confirmed_at=now,
+        cash_confirmed_at=now,
+    )
+    db_session.commit()
+    snapshot_id = price.id
+    assert db_session.scalar(select(PortfolioSnapshot)).total_value_cents == 3_000
+    assert login(client).status_code == 303
+
+    response = client.post(
+        f"/prices/{snapshot_id}/delete",
+        data={"csrf_token": csrf(client, "/prices/new")},
+    )
+
+    assert response.status_code == 303
+    db_session.expire_all()
+    refreshed = db_session.scalar(select(PortfolioSnapshot))
+    assert refreshed is not None
+    assert refreshed.data_complete is False
+    assert refreshed.total_value_cents is None

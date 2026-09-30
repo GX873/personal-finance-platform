@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,11 +27,18 @@ from finance_app.db import get_db, utc_now
 from finance_app.ledger.models import (
     Account,
     Asset,
+    AuditEvent,
     CashBucket,
+    Holding,
     Transaction,
 )
 from finance_app.ledger.schemas import PostTransaction
 from finance_app.ledger.service import post_transaction, reverse_transaction
+from finance_app.market.analytics import Period
+from finance_app.market.base import QuoteType
+from finance_app.market.efinance_adapter import EfinanceEstimateAdapter
+from finance_app.market.service import FundPriceService, RefreshResult, RefreshStatus
+from finance_app.market.tiantian_estimate import TiantianEstimateProvider
 from finance_app.notifications.models import AppSetting, NotificationChannel
 from finance_app.ops.backup import backup_directory, recent_backup_statuses
 from finance_app.portfolio.models import (
@@ -53,6 +60,7 @@ from finance_app.web.forms import (
     parse_yuan,
     required_text,
 )
+from finance_app.web.fund_center import build_fund_center
 from finance_app.web.viewmodels import dashboard, money
 
 router = APIRouter()
@@ -75,6 +83,10 @@ _CHANNEL_LABELS = {
     "wecom": "企业微信",
 }
 _SCHEDULE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z", re.ASCII)
+_FUND_TABS = frozenset({"quotes", "risk", "holdings", "manual"})
+_FUND_PERIODS = frozenset(item.value for item in Period)
+_MANUAL_REFRESH_EVENT = "fund.refresh_requested"
+_MANUAL_REFRESH_COOLDOWN_SECONDS = 60
 
 
 def shanghai_datetime(value: datetime) -> str:
@@ -252,6 +264,134 @@ def _manual_page(
     )
 
 
+def _fund_page(
+    request: Request,
+    db: Session,
+    user: User,
+    *,
+    tab: str,
+    asset_id: int | None = None,
+    period: str = Period.ONE_YEAR.value,
+    status_code: int = 200,
+    error: str | None = None,
+    values: dict[str, str] | None = None,
+    editing_price_id: int | None = None,
+):
+    active_tab = tab if tab in _FUND_TABS else "quotes"
+    selected_period = period if period in _FUND_PERIODS else Period.ONE_YEAR.value
+    vm = build_fund_center(
+        db,
+        selected_asset_id=asset_id,
+        period=selected_period,
+        now=utc_now(),
+    )
+    vm["today"] = _today()
+    context = _base_context(request, user, "prices")
+    context.update(
+        {
+            "active_tab": active_tab,
+            "fund_tab": active_tab,
+            "vm": vm,
+            "accounts": list(db.scalars(select(Account).order_by(Account.name))),
+            "assets": list(db.scalars(select(Asset).order_by(Asset.code))),
+            "error": error,
+            "values": values or {},
+            "account_values": {},
+            "asset_values": {},
+            "local_now": datetime.now(SHANGHAI).strftime("%Y-%m-%dT%H:%M"),
+            "price_rows": list(
+                db.scalars(
+                    select(PriceSnapshot)
+                    .order_by(
+                        PriceSnapshot.valuation_date.desc(),
+                        PriceSnapshot.id.desc(),
+                    )
+                    .limit(100)
+                )
+            ),
+            "price_asset_names": {
+                row.id: row.name for row in db.scalars(select(Asset))
+            },
+            "editing_price_id": editing_price_id,
+        }
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="price_form.html",
+        context=context,
+        status_code=status_code,
+    )
+
+
+def _require_held_cn_fund(db: Session, asset_id: int) -> Asset:
+    asset = db.scalar(
+        select(Asset).where(
+            Asset.id == asset_id,
+            Asset.market == "CN",
+            Asset.asset_class == "fund",
+        )
+    )
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Held fund not found")
+    quantity = db.scalar(
+        select(func.coalesce(func.sum(Holding.quantity), 0)).where(
+            Holding.asset_id == asset.id
+        )
+    )
+    if Decimal(quantity or 0) <= 0:
+        raise HTTPException(status_code=404, detail="Held fund not found")
+    return asset
+
+
+def _manual_refresh_allowed(
+    db: Session,
+    asset_id: int,
+    now: datetime,
+    *,
+    cooldown_seconds: int = _MANUAL_REFRESH_COOLDOWN_SECONDS,
+) -> bool:
+    recent = db.scalar(
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.event_type == _MANUAL_REFRESH_EVENT,
+            AuditEvent.entity_type == "asset",
+            AuditEvent.entity_id == asset_id,
+            AuditEvent.created_at > now - timedelta(seconds=cooldown_seconds),
+        )
+        .order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+        .limit(1)
+    )
+    return recent is None
+
+
+def _refresh_audit_event(
+    *,
+    user: User,
+    asset_id: int,
+    result: RefreshResult,
+    attempted_at: datetime,
+) -> AuditEvent:
+    event = audit_event(
+        user=user,
+        event_type=_MANUAL_REFRESH_EVENT,
+        action="fund.refresh",
+        entity_type="asset",
+        entity_id=asset_id,
+        summary={
+            "status": result.status.value,
+            "source": result.source,
+            "attempts": result.attempts,
+            "error": (
+                None
+                if result.status is RefreshStatus.SUCCESS
+                else "estimate_unavailable"
+            ),
+        },
+    )
+    event.created_at = attempted_at
+    return event
+
+
 @router.get("/", response_class=HTMLResponse)
 @router.get("/holdings", response_class=HTMLResponse)
 @router.get("/alerts", response_class=HTMLResponse)
@@ -345,7 +485,28 @@ def price_form(request: Request, db: Annotated[Session, Depends(get_db)]):
     user = current_user(request, db)
     if user is None:
         return RedirectResponse("/login", status_code=303)
-    return _manual_page(request, db, user, name="price_form.html", section="prices")
+    return _fund_page(request, db, user, tab="manual")
+
+
+@router.get("/funds", response_class=HTMLResponse)
+def fund_center_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    tab: str = "quotes",
+    asset_id: int | None = None,
+    period: str = Period.ONE_YEAR.value,
+):
+    user = current_user(request, db)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return _fund_page(
+        request,
+        db,
+        user,
+        tab=tab,
+        asset_id=asset_id,
+        period=period,
+    )
 
 
 @router.get("/prices/{price_id}/edit", response_class=HTMLResponse)
@@ -362,12 +523,12 @@ def edit_price_form(
         raise HTTPException(status_code=404, detail="Price not found")
     if not snapshot.source.startswith("manual:"):
         raise HTTPException(status_code=403, detail="Only manual prices can be edited")
-    return _manual_page(
+    return _fund_page(
         request,
         db,
         user,
-        name="price_form.html",
-        section="prices",
+        tab="manual",
+        asset_id=snapshot.asset_id,
         values={
             "asset_id": str(snapshot.asset_id),
             "valuation_date": snapshot.valuation_date.isoformat(),
@@ -781,6 +942,45 @@ async def reverse_manual_transaction(
     return RedirectResponse("/transactions", status_code=303)
 
 
+@router.post("/funds/{asset_id}/refresh", dependencies=[Depends(require_csrf)])
+def refresh_fund_estimate(
+    asset_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    asset = _require_held_cn_fund(db, asset_id)
+    attempted_at = utc_now()
+    if not _manual_refresh_allowed(db, asset.id, attempted_at):
+        return RedirectResponse(
+            f"/funds?asset_id={asset.id}&refresh=cooldown", status_code=303
+        )
+
+    primary = TiantianEstimateProvider(clock=utc_now)
+    try:
+        result = FundPriceService(db, primary, clock=utc_now).refresh_with_fallback(
+            asset.code,
+            [primary, EfinanceEstimateAdapter(clock=utc_now)],
+            required_quote_type=QuoteType.INTRADAY_ESTIMATE,
+        )
+        db.add(
+            _refresh_audit_event(
+                user=user,
+                asset_id=asset.id,
+                result=result,
+                attempted_at=attempted_at,
+            )
+        )
+        db.commit()
+    finally:
+        primary.close()
+
+    state = "success" if result.status is RefreshStatus.SUCCESS else "failed"
+    return RedirectResponse(
+        f"/funds?asset_id={asset.id}&refresh={state}", status_code=303
+    )
+
+
 @router.post("/prices", dependencies=[Depends(require_csrf)])
 async def create_price(
     request: Request,
@@ -836,12 +1036,11 @@ async def create_price(
         db.commit()
     except (FormError, IntegrityError, ValueError) as exc:
         db.rollback()
-        return _manual_page(
+        return _fund_page(
             request,
             db,
             user,
-            name="price_form.html",
-            section="prices",
+            tab="manual",
             status_code=422,
             error=str(exc),
             values=values,
@@ -915,17 +1114,52 @@ async def update_price(
         db.commit()
     except (FormError, IntegrityError, ValueError) as exc:
         db.rollback()
-        return _manual_page(
+        return _fund_page(
             request,
             db,
             user,
-            name="price_form.html",
-            section="prices",
+            tab="manual",
+            asset_id=snapshot.asset_id,
             status_code=422,
             error=str(exc),
             values=values,
             editing_price_id=price_id,
         )
+    return RedirectResponse("/prices/new", status_code=303)
+
+
+@router.post("/prices/{price_id}/delete", dependencies=[Depends(require_csrf)])
+def delete_price(
+    price_id: int,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[User, Depends(require_user)],
+):
+    snapshot = db.get(PriceSnapshot, price_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Price not found")
+    if not snapshot.source.startswith("manual:"):
+        raise HTTPException(status_code=403, detail="Only manual prices can be deleted")
+    old = {
+        "asset_id": snapshot.asset_id,
+        "valuation_date": snapshot.valuation_date.isoformat(),
+        "price": format(snapshot.price, "f"),
+        "source": snapshot.source,
+    }
+    db.delete(snapshot)
+    db.flush()
+    refresh_current_snapshot_after_price_update(db, now=utc_now())
+    db.add(
+        audit_event(
+            user=user,
+            event_type="price.deleted",
+            action="price.delete",
+            entity_type="price_snapshot",
+            entity_id=price_id,
+            summary={"old": old},
+        )
+    )
+    db.commit()
     return RedirectResponse("/prices/new", status_code=303)
 
 
