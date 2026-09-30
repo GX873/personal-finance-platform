@@ -35,7 +35,7 @@ def test_backup_passes_integrity_and_application_schema(populated_db: Path, tmp_
     result = verify_backup(backup, require_checksum=True)
     assert result.integrity_check == "ok"
     assert result.schema_valid is True
-    assert result.schema_revision == "0004"
+    assert result.schema_revision == "0005"
     assert {path.name for path in directory.iterdir()} == {
         backup.name,
         f"{backup.name}.sha256",
