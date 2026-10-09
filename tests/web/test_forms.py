@@ -878,9 +878,14 @@ def test_fund_center_renders_four_fund_only_views(client, db_session, monkeypatc
     for label in ("行情", "风险分析", "持仓跟踪", "手工净值"):
         assert label in quotes.text
     assert 'data-active-tab="quotes"' in quotes.text
-    assert "正式净值" in quotes.text
-    assert "盘中估值" in quotes.text
-    assert "数据来源" in quotes.text
+    for label in (
+        "最新官方净值",
+        "官方净值日期",
+        "数据来源",
+        "最近获取时间",
+        "获取最新官方净值",
+    ):
+        assert label in quotes.text
     assert 'viewBox="0 0 600 220"' in quotes.text
     assert f'action="/funds/{asset.id}/refresh"' in quotes.text
     assert 'name="csrf_token"' in form_markup(
@@ -894,7 +899,9 @@ def test_fund_center_renders_four_fund_only_views(client, db_session, monkeypatc
     assert "风险等级" in risk.text
     assert "组合占比" in holdings.text
     assert "持仓收益率" in holdings.text
-    assert "盘中估算盈亏" in holdings.text
+    active_ui = quotes.text + risk.text + holdings.text
+    for forbidden in ("盘中估值", "估算涨跌", "估算盈亏", "刷新行情"):
+        assert forbidden not in active_ui
     for forbidden in ("重仓股", "股票", "确认陈旧"):
         assert forbidden not in quotes.text + risk.text + holdings.text
 
@@ -906,11 +913,25 @@ def test_fund_center_missing_metrics_and_refresh_result_are_compact(
     assert login(client).status_code == 303
 
     missing = client.get(f"/funds?tab=risk&asset_id={asset.id}")
+    success = client.get(f"/funds?asset_id={asset.id}&refresh=success")
+    failed = client.get(f"/funds?asset_id={asset.id}&refresh=failed")
     refreshed = client.get(f"/funds?asset_id={asset.id}&refresh=cooldown")
 
     assert missing.text.count("暂无数据") >= 4
+    assert "已获取上游最新官方净值，实际净值日期见下方。" in success.text
+    assert "暂时未获取到官方净值，已保留最近有效数据。" in failed.text
     assert 'role="status"' in refreshed.text
     assert "刷新过于频繁" in refreshed.text
+
+
+def test_holding_table_labels_official_nav_status_only():
+    template = Path("finance_app/templates/holding_table.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "官方净值日期 {{ h.date }}" in template
+    assert "暂无官方净值" in template
+    assert "h.estimate" not in template
 
 
 def test_manual_tab_has_quick_summary_edit_and_delete_controls(client, db_session):
@@ -946,6 +967,7 @@ def test_fund_center_css_has_stable_responsive_layout():
     assert "aspect-ratio:30/11" in css
     assert ".fund-metrics" in css
     assert "repeat(3,minmax(0,1fr))" in css
+    assert ".quote-estimate" not in css
     mobile_css = css.split("@media(max-width:760px)", 1)[1]
     assert ".fund-center-grid,.fund-metrics{grid-template-columns:1fr}" in mobile_css
     assert ".fund-tabs{overflow-x:auto}" in mobile_css

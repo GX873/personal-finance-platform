@@ -128,18 +128,13 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
                     )
                     .limit(1)
             )
-            official = db.scalar(
+            price = db.scalar(
                 price_query.where(PriceSnapshot.quote_type == "official_nav")
             )
-            price = official or db.scalar(
-                price_query.where(PriceSnapshot.quote_type == "intraday_estimate")
-            )
-            estimate = price is not None and price.quote_type == "intraday_estimate"
             amount = (
                 value_cents(holding.quantity, price.price)
                 if (
                     price
-                    and not estimate
                     and holding.quantity > 0
                     and asset.currency == account.currency == "CNY"
                 )
@@ -161,10 +156,9 @@ def dashboard(db: Session | None = None, *, section: str = "dashboard") -> dict:
                     "nav": format(price.price.normalize(), "f") if price else "待补充",
                     "date": price.valuation_date.isoformat() if price else "—",
                     "source": price.source if price else "无有效来源",
-                    "estimate": estimate,
                     "quote_type": price.quote_type if price else None,
                     "value": money(amount),
-                    "fresh": bool(price and not estimate),
+                    "fresh": bool(price),
                     "priced": amount is not None,
                     "updated_at": holding.updated_at,
                 }

@@ -2,7 +2,7 @@
 {% block title %}基金数据{% endblock %}
 {% block eyebrow %}FUND DATA{% endblock %}
 {% block heading %}基金数据中心{% endblock %}
-{% block subtitle %}查看正式净值、盘中估值与持仓风险。{% endblock %}
+{% block subtitle %}查看官方净值、历史走势与持仓风险。{% endblock %}
 {% block content %}
 <nav class="fund-tabs" aria-label="基金数据视图" data-active-tab="{{ active_tab }}">
   <a href="/funds?tab=quotes&amp;asset_id={{ vm.selected.asset_id or '' }}&amp;period={{ vm.period }}" {{ 'aria-current=page' if active_tab == 'quotes' }}>行情</a>
@@ -11,9 +11,9 @@
   <a href="/prices/new" {{ 'aria-current=page' if active_tab == 'manual' }}>手工净值</a>
 </nav>
 
-{% if request.query_params.get('refresh') == 'success' %}<p class="refresh-result" role="status">盘中估值已刷新。</p>
+{% if request.query_params.get('refresh') == 'success' %}<p class="refresh-result" role="status">已获取上游最新官方净值，实际净值日期见下方。</p>
 {% elif request.query_params.get('refresh') == 'cooldown' %}<p class="refresh-result" role="status">刷新过于频繁，请稍后再试。</p>
-{% elif request.query_params.get('refresh') == 'failed' %}<p class="refresh-result refresh-failed" role="status">暂时未获取到盘中估值，已保留原数据。</p>{% endif %}
+{% elif request.query_params.get('refresh') == 'failed' %}<p class="refresh-result refresh-failed" role="status">暂时未获取到官方净值，已保留最近有效数据。</p>{% endif %}
 
 {% if active_tab in ('quotes', 'risk') %}
 <section class="panel fund-center-grid">
@@ -27,18 +27,14 @@
     <div class="fund-detail-heading"><div><p class="eyebrow">{{ vm.selected.code }}</p><h2>{{ vm.selected.name }}</h2></div><span class="pill">仅基金</span></div>
     {% if active_tab == 'quotes' %}
     <div class="quote-summary">
-      <section><span>正式净值</span><strong>{{ vm.selected.official_nav if vm.selected.official_nav is not none else '暂无数据' }}</strong><small>{{ vm.selected.official_date or '暂无日期' }}</small></section>
-      <section class="quote-estimate"><span>盘中估值</span><strong>{{ vm.selected.intraday_estimate if vm.selected.intraday_estimate is not none else '暂无数据' }}</strong><small>{{ ((vm.selected.intraday_change * 100)|round(2)|string ~ '%') if vm.selected.intraday_change is not none else '暂无涨跌' }}</small></section>
+      <section><span>最新官方净值</span><strong>{{ vm.selected.official_nav if vm.selected.official_nav is not none else '暂无数据' }}</strong><small>官方净值日期 {{ vm.selected.official_date or '暂无日期' }}</small></section>
     </div>
     <dl class="quote-meta">
       <div><dt>数据来源</dt><dd>{{ vm.selected.data_source or '暂无数据' }}</dd></div>
-      <div><dt>正式净值时间</dt><dd>{{ vm.selected.official_fetched_at or '暂无数据' }}</dd></div>
-      <div><dt>估值来源</dt><dd>{{ vm.selected.estimate_source or '暂无数据' }}</dd></div>
-      <div><dt>估值更新时间</dt><dd>{{ vm.selected.estimate_fetched_at or '暂无数据' }}</dd></div>
+      <div><dt>最近获取时间</dt><dd>{{ vm.selected.official_fetched_at or '暂无数据' }}</dd></div>
     </dl>
     <div class="fund-actions">
-      <form method="post" action="/funds/{{ vm.selected.asset_id }}/refresh"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">刷新行情</button></form>
-      <span class="hint">盘中估值不计入正式总资产</span>
+      <form method="post" action="/funds/{{ vm.selected.asset_id }}/refresh"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">获取最新官方净值</button></form>
     </div>
     <div class="history-heading"><h3>历史净值</h3><nav class="period-switcher" aria-label="历史周期">{% for period in vm.periods %}<a href="/funds?tab=quotes&amp;asset_id={{ vm.selected.asset_id }}&amp;period={{ period }}" {{ 'aria-current=page' if period == vm.period }}>{{ {'1m':'近1月','3m':'近3月','6m':'近6月','1y':'近1年','all':'全部'}[period] }}</a>{% endfor %}</nav></div>
     <div class="fund-chart" role="img" aria-label="{{ vm.selected.name }}历史正式净值曲线">
@@ -61,7 +57,7 @@
 {% elif active_tab == 'holdings' %}
 <section class="panel">
   <div class="section-heading"><h2>持仓基金跟踪</h2><span class="pill">{{ vm.funds|length }} 只基金</span></div>
-  {% if vm.funds %}<div class="fund-table-wrap"><table class="fund-holdings-table"><thead><tr><th>基金</th><th>正式金额</th><th>组合占比</th><th>成本</th><th>正式净值</th><th>持仓收益率</th><th>盘中估值</th><th>盘中估算盈亏</th><th>最大回撤</th><th>波动率</th><th>风险</th></tr></thead><tbody>{% for fund in vm.funds %}<tr><td><a class="text-link" href="/funds?asset_id={{ fund.asset_id }}&amp;period={{ vm.period }}">{{ fund.name }}</a><small>{{ fund.code }}</small></td><td>{{ ('¥ ' ~ (fund.official_value_cents|money)) if fund.official_value_cents is not none else '暂无数据' }}</td><td>{{ ((fund.portfolio_percent * 100)|round(2)|string ~ '%') if fund.portfolio_percent is not none else '暂无数据' }}</td><td>¥ {{ fund.cost_cents|money }}</td><td>{{ fund.official_nav or '暂无数据' }}</td><td>{{ ((fund.holding_return * 100)|round(2)|string ~ '%') if fund.holding_return is not none else '暂无数据' }}</td><td class="quote-estimate">{{ fund.intraday_estimate or '暂无数据' }}</td><td class="quote-estimate">{{ ('¥ ' ~ (fund.estimated_profit_cents|money)) if fund.estimated_profit_cents is not none else '暂无数据' }}</td><td>{{ ((fund.max_drawdown * 100)|round(2)|string ~ '%') if fund.max_drawdown is not none else '暂无数据' }}</td><td>{{ ((fund.annualized_volatility * 100)|round(2)|string ~ '%') if fund.annualized_volatility is not none else '暂无数据' }}</td><td>{{ fund.risk_label or '暂无数据' }}</td></tr>{% endfor %}</tbody></table></div>
+  {% if vm.funds %}<div class="fund-table-wrap"><table class="fund-holdings-table"><thead><tr><th>基金</th><th>官方金额</th><th>组合占比</th><th>成本</th><th>官方净值</th><th>持仓收益率</th><th>最大回撤</th><th>波动率</th><th>风险</th></tr></thead><tbody>{% for fund in vm.funds %}<tr><td><a class="text-link" href="/funds?asset_id={{ fund.asset_id }}&amp;period={{ vm.period }}">{{ fund.name }}</a><small>{{ fund.code }}</small></td><td>{{ ('¥ ' ~ (fund.official_value_cents|money)) if fund.official_value_cents is not none else '暂无数据' }}</td><td>{{ ((fund.portfolio_percent * 100)|round(2)|string ~ '%') if fund.portfolio_percent is not none else '暂无数据' }}</td><td>¥ {{ fund.cost_cents|money }}</td><td>{{ fund.official_nav or '暂无数据' }}</td><td>{{ ((fund.holding_return * 100)|round(2)|string ~ '%') if fund.holding_return is not none else '暂无数据' }}</td><td>{{ ((fund.max_drawdown * 100)|round(2)|string ~ '%') if fund.max_drawdown is not none else '暂无数据' }}</td><td>{{ ((fund.annualized_volatility * 100)|round(2)|string ~ '%') if fund.annualized_volatility is not none else '暂无数据' }}</td><td>{{ fund.risk_label or '暂无数据' }}</td></tr>{% endfor %}</tbody></table></div>
   {% else %}<p class="hint">暂无持仓基金。</p>{% endif %}
 </section>
 
@@ -78,7 +74,7 @@
     <button type="submit">{{ '更新净值' if editing_price_id else '保存净值' }}</button>
   </form></div>
   <aside class="manual-quick-summary"><div class="section-heading"><h2>当前基金摘要</h2><span class="pill">正式数据</span></div>
-    {% if vm.funds and vm.selected.asset_id %}<h3>{{ vm.selected.name }}</h3><p class="hint">{{ vm.selected.code }}</p><dl><div><dt>正式净值</dt><dd>{{ vm.selected.official_nav or '暂无数据' }}</dd></div><div><dt>盘中估值</dt><dd class="quote-estimate">{{ vm.selected.intraday_estimate or '暂无数据' }}</dd></div><div><dt>数据来源</dt><dd>{{ vm.selected.data_source or '暂无数据' }}</dd></div><div><dt>持仓收益率</dt><dd>{{ ((vm.selected.holding_return * 100)|round(2)|string ~ '%') if vm.selected.holding_return is not none else '暂无数据' }}</dd></div></dl>
+    {% if vm.funds and vm.selected.asset_id %}<h3>{{ vm.selected.name }}</h3><p class="hint">{{ vm.selected.code }}</p><dl><div><dt>官方净值</dt><dd>{{ vm.selected.official_nav or '暂无数据' }}</dd></div><div><dt>官方净值日期</dt><dd>{{ vm.selected.official_date or '暂无数据' }}</dd></div><div><dt>数据来源</dt><dd>{{ vm.selected.data_source or '暂无数据' }}</dd></div><div><dt>持仓收益率</dt><dd>{{ ((vm.selected.holding_return * 100)|round(2)|string ~ '%') if vm.selected.holding_return is not none else '暂无数据' }}</dd></div></dl>
     {% else %}<p class="hint">暂无持仓基金摘要。</p>{% endif %}
   </aside>
 </section>

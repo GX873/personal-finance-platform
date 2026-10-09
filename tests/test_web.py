@@ -339,7 +339,7 @@ def test_history_and_prices_use_bounded_queries(db_session):
     assert bounded and all("limit" in sql for sql in bounded)
 
 
-def test_intraday_estimate_is_reference_only(db_session, monkeypatch):
+def test_intraday_estimate_only_holding_is_unpriced(db_session, monkeypatch):
     from datetime import datetime
     from decimal import Decimal
 
@@ -370,7 +370,7 @@ def test_intraday_estimate_is_reference_only(db_session, monkeypatch):
 
     data = dashboard(db_session)
 
-    assert data["holdings"][0]["nav"] == "1.2"
-    assert data["holdings"][0]["estimate"] is True
+    assert data["holdings"][0]["nav"] == "待补充"
+    assert "estimate" not in data["holdings"][0]
     assert data["holdings"][0]["priced"] is False
     assert data["priced_total"] == 0

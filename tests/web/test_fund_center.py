@@ -216,7 +216,7 @@ def seed_history_with_large_intraday_outlier(db: Session) -> Asset:
     return asset
 
 
-def test_fund_center_uses_official_nav_for_value_and_estimate_only_for_preview(
+def test_fund_center_serializes_only_official_nav(
     db_session: Session,
 ):
     seeded = seed_fund_center(db_session)
@@ -229,18 +229,20 @@ def test_fund_center_uses_official_nav_for_value_and_estimate_only_for_preview(
     )
 
     assert [row["asset_id"] for row in vm["funds"]] == seeded.held_asset_ids
-    assert vm["selected"]["quantity"] == Decimal("10.00000000")
-    assert vm["selected"]["cost_cents"] == 900
-    assert vm["selected"]["official_nav"] == "1.20000000"
-    assert vm["selected"]["intraday_estimate"] == "1.23000000"
-    assert vm["selected"]["official_value_cents"] == 1200
-    assert vm["selected"]["estimated_value_cents"] == 1230
-    assert vm["selected"]["official_profit_cents"] == 300
-    assert vm["selected"]["estimated_profit_cents"] == 330
-    assert vm["selected"]["data_source"] == "eastmoney"
-    assert vm["selected"]["estimate_source"] == "tiantian:estimate"
+    selected = vm["selected"]
+    assert selected["quantity"] == Decimal("10.00000000")
+    assert selected["cost_cents"] == 900
+    assert selected["official_nav"] == "1.20000000"
+    assert selected["official_date"] == "2026-09-29"
+    assert selected["official_value_cents"] == 1200
+    assert selected["official_profit_cents"] == 300
+    assert selected["data_source"] == "eastmoney"
+    assert selected["official_fetched_at"] is not None
+    assert "intraday_estimate" not in selected
+    assert "estimated_profit_cents" not in selected
     assert vm["metrics"]["total_return"] is not None
     assert vm["funds"][0]["portfolio_percent"] == Decimal("0.85714286")
+    assert all(point["quote_type"] == "official_nav" for point in vm["history"])
 
 
 def test_fund_center_never_substitutes_missing_values_with_zero(db_session: Session):
@@ -277,8 +279,8 @@ def test_fund_center_never_substitutes_missing_values_with_zero(db_session: Sess
 
     assert vm["selected"]["official_nav"] is None
     assert vm["selected"]["official_value_cents"] is None
-    assert vm["selected"]["intraday_estimate"] is None
-    assert vm["selected"]["estimated_value_cents"] is None
+    assert "intraday_estimate" not in vm["selected"]
+    assert "estimated_value_cents" not in vm["selected"]
     assert vm["selected"]["holding_return"] is None
     assert vm["metrics"]["total_return"] is None
     assert vm["chart"]["points"] == []

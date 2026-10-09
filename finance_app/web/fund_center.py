@@ -136,14 +136,8 @@ def _serialize_fund(
     now: datetime,
 ) -> dict[str, object]:
     official = _latest_quote(db, holding.asset_id, QuoteType.OFFICIAL_NAV, now)
-    estimate = _latest_quote(
-        db, holding.asset_id, QuoteType.INTRADAY_ESTIMATE, now
-    )
     official_value = (
         value_cents(holding.quantity, official.price) if official is not None else None
-    )
-    estimated_value = (
-        value_cents(holding.quantity, estimate.price) if estimate is not None else None
     )
     history = _official_history(db, holding.asset_id, period, now)
     metrics = calculate_metrics([row.price for row in history])
@@ -161,19 +155,6 @@ def _serialize_fund(
         "official_fetched_at": _datetime_text(official),
         "data_source": official.source if official is not None else None,
         "source_url": official.source_url if official is not None else None,
-        "intraday_estimate": _price_text(estimate),
-        "estimated_value_cents": estimated_value,
-        "estimated_profit_cents": _profit(estimated_value, holding.cost_cents),
-        "estimated_return": _return(estimated_value, holding.cost_cents),
-        "intraday_change": (
-            _decimal_ratio(estimate.price - official.price, official.price)
-            if estimate is not None and official is not None
-            else None
-        ),
-        "estimate_date": _date_text(estimate),
-        "estimate_fetched_at": _datetime_text(estimate),
-        "estimate_source": estimate.source if estimate is not None else None,
-        "estimate_source_url": estimate.source_url if estimate is not None else None,
         "portfolio_percent": None,
         **_serialize_metrics(metrics),
     }
@@ -321,13 +302,10 @@ def _empty_fund_center(period: Period) -> dict[str, object]:
             "official_value_cents": None,
             "official_profit_cents": None,
             "holding_return": None,
+            "official_date": None,
+            "official_fetched_at": None,
             "data_source": None,
-            "intraday_estimate": None,
-            "estimated_value_cents": None,
-            "estimated_profit_cents": None,
-            "estimated_return": None,
-            "intraday_change": None,
-            "estimate_source": None,
+            "source_url": None,
             "portfolio_percent": None,
             **_serialize_metrics(_EMPTY_METRICS),
         },
@@ -361,10 +339,6 @@ def _ratio(numerator: int, denominator: int) -> Decimal:
     return (Decimal(numerator) / Decimal(denominator)).quantize(
         _RATIO_SCALE, rounding=ROUND_HALF_UP
     )
-
-
-def _decimal_ratio(numerator: Decimal, denominator: Decimal) -> Decimal:
-    return (numerator / denominator).quantize(_RATIO_SCALE, rounding=ROUND_HALF_UP)
 
 
 def _coordinate(value: Decimal) -> int | float:
