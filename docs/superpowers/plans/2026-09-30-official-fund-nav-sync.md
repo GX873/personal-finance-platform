@@ -4,7 +4,7 @@
 
 **Goal:** Replace unreliable intraday fund estimates with an official-NAV-only workflow that synchronizes published NAVs after market close, shows their real valuation dates, and preserves the existing 14:00 advice reminder without implying same-day closing data.
 
-**Architecture:** Keep `PriceSnapshot.quote_type` unchanged so historical `intraday_estimate` rows remain auditable, but remove every runtime producer and UI consumer of those rows. Add a focused `OfficialNavSyncJob` that selects distinct positive CN fund holdings, uses EastMoney first and `efinance` only after a transport/data failure, and persists official NAVs through `FundPriceService`. Run that job from a dedicated CLI command and systemd timer; keep the advice job independent and read-only with respect to market providers.
+**Architecture:** Keep `PriceSnapshot.quote_type` unchanged so historical `intraday_estimate` rows remain auditable, but remove every runtime producer and UI consumer of those rows. Add a focused `OfficialNavSyncJob` with two distinct responsibilities: refresh the current official NAV for each distinct positive CN fund holding through EastMoney-first `FundPriceService` fallback, and backfill official history for every tracked CN fund asset, including unheld candidates, through an injected history-capable provider. Both paths are per-fund isolated and idempotent. Run the job from a dedicated CLI command and systemd timer; keep the advice job independent and read-only with respect to market providers. The history backfill sends no notifications and requires no schema or migration changes.
 
 **Tech Stack:** Python 3.12+, FastAPI, SQLAlchemy, Jinja2, pytest, Ruff, systemd, EastMoney HTTP provider, `efinance==0.5.9` fallback.
 
@@ -17,7 +17,7 @@ The dedicated worktree is `H:\1A\personal-finance-platform` on branch `feature/p
 Files and responsibilities after the change:
 
 - `finance_app/market/service.py`: persist valid official NAVs, distinguish provider failure from normal publication lag, and keep fallback ordering deterministic.
-- `finance_app/market/nav_job.py`: own held-fund selection, holiday-aware scheduled execution, per-fund isolation, and attempted/succeeded/unchanged/failed counts.
+- `finance_app/market/nav_job.py`: own holiday-aware scheduling, current-NAV refresh for distinct positive held CN funds, and idempotent history backfill for every tracked CN fund asset (including unheld candidates), with per-fund isolation and attempted/succeeded/unchanged/failed counts.
 - `finance_app/cli.py`: expose `finance nav-refresh --scheduled`; keep the 14:00 advice command independent from NAV providers.
 - `finance_app/web/fund_center.py`, `finance_app/web/viewmodels.py`, `finance_app/web/routes.py`: read and refresh official NAVs only.
 - `finance_app/templates/price_form.html`, `finance_app/templates/holding_table.html`, `finance_app/static/forms.css`: present official NAV, valuation date, source, and fetch time without estimate language.
@@ -134,7 +134,7 @@ git add finance_app/market/base.py finance_app/market/efinance_adapter.py financ
 git commit -m "fix: accept latest published official nav"
 ```
 
-### Task 2: Add the independent held-fund official NAV synchronization job
+### Task 2: Add the independent held-fund refresh and tracked-history backfill job
 
 **Files:**
 - Create: `finance_app/market/nav_job.py`
@@ -145,7 +145,7 @@ git commit -m "fix: accept latest published official nav"
 - Delete: `tests/market/test_intraday_job.py`
 - Delete: `tests/market/test_tiantian_estimate.py`
 
-- [ ] **Step 1: Write job tests for scope, fallback, idempotency, failure isolation, and holidays**
+- [ ] **Step 1: Write job tests for held scope, history scope, fallback, idempotency, failure isolation, and holidays**
 
 Create `tests/market/test_nav_job.py` using the existing `_seed_refresh_scope` fixture pattern. The central assertions must be:
 
@@ -205,6 +205,57 @@ def test_evening_holiday_is_skipped_but_morning_backfill_runs(db_session):
 
 Add a per-code failing provider case that proves one failure does not stop the next code, plus a primary-failure/fallback-success case.
 
+Add history-provider tests that make the scope distinction explicit:
+
+```python
+def test_job_backfills_history_for_unheld_tracked_cn_fund(db_session):
+    candidate = seed_unheld_cn_fund(db_session)
+    history = PerCodeHistoryProvider(
+        {candidate.code: [official_quote("2026-09-26"), official_quote("2026-09-29")]}
+    )
+
+    result = OfficialNavSyncJob(
+        db_session,
+        providers=[PerCodeProvider()],
+        history_provider=history,
+        clock=lambda: EVENING_NOW,
+    ).run_scheduled()
+
+    assert result == NavSyncResult("success", 0, 0, 0, 0)
+    assert history.calls == [candidate.code]
+    assert count_official_snapshots(db_session, candidate.code) == 2
+
+
+def test_history_failure_isolated_and_repeat_is_idempotent(db_session):
+    failed, good = seed_two_tracked_cn_funds(db_session, unheld=True)
+    history = PerCodeHistoryProvider(
+        {
+            failed.code: RuntimeError("provider unavailable"),
+            good.code: [official_quote("2026-09-29")],
+        }
+    )
+    job = OfficialNavSyncJob(
+        db_session,
+        providers=[PerCodeProvider()],
+        history_provider=history,
+        clock=lambda: EVENING_NOW,
+    )
+
+    job.run_scheduled()
+    first_count = count_official_snapshots(db_session, good.code)
+    job.run_scheduled()
+
+    assert history.calls == [failed.code, good.code, failed.code, good.code]
+    assert count_official_snapshots(db_session, good.code) == first_count
+    assert count_history_failure_audits(db_session, failed.code) == 2
+```
+
+The tests must also assert that history backfill does not create notification
+rows, does not alter holdings/cash/transactions, and does not require a schema
+or migration revision. The injected history provider must expose a
+`fetch_history(code, limit=...)` boundary and return only official NAV quotes;
+the job must ignore future-dated or non-official rows.
+
 - [ ] **Step 2: Write CLI boundary tests**
 
 In the same file, test `main(["nav-refresh", "--scheduled"])` with injected `EastMoneyFundNavProvider`, `EfinanceAdapter`, and `OfficialNavSyncJob`. Assert the primary HTTP provider is closed and output is exactly:
@@ -244,11 +295,15 @@ class NavSyncResult:
 
 
 class OfficialNavSyncJob:
-    def __init__(self, session, *, providers, clock=utc_now):
+    def __init__(self, session, *, providers, history_provider=None, clock=utc_now):
         if not providers:
             raise ValueError("at least one official NAV provider is required")
         self.session = session
         self.providers = list(providers)
+        self.history_provider = history_provider or next(
+            (provider for provider in self.providers if callable(getattr(provider, "fetch_history", None))),
+            None,
+        )
         self.clock = clock
 
     def run_scheduled(self) -> NavSyncResult:
@@ -256,7 +311,9 @@ class OfficialNavSyncJob:
         holidays = parse_holidays(self._setting("cn_holidays", "[]"))
         if local.hour >= 12 and is_skipped_reminder_day(local.date(), holidays):
             return NavSyncResult("skipped", 0, 0, 0, 0)
-        return self.refresh_held_funds()
+        result = self.refresh_held_funds()
+        self.backfill_tracked_funds()
+        return result
 ```
 
 `refresh_held_funds()` must select distinct `Asset.code` values joined to `Holding` with `Holding.quantity > 0`, `Asset.market == "CN"`, and `Asset.asset_class == "fund"`. Before each refresh, capture the IDs of matching official snapshots. Call:
@@ -270,6 +327,16 @@ result = service.refresh_with_fallback(
 ```
 
 Count `SUCCESS` with a pre-existing returned snapshot ID as `unchanged`; count a new snapshot as `succeeded`; count other results as `failed`. Commit once after the loop. Return overall `failed` only when at least one code was attempted and every code failed.
+
+`backfill_tracked_funds()` must independently select every `Asset` with
+`market == "CN"` and `asset_class == "fund"`, without requiring a positive
+`Holding`. For each asset, call the injected/history-capable provider's
+`fetch_history(asset.code, limit=500)`. Catch and audit a failure for one asset
+without stopping the remaining assets. Insert only missing official rows keyed
+by asset, valuation date, source, and quote type; skip future dates and
+non-official quotes, commit idempotently, and return the inserted count. This
+history pass must not send notifications, change holdings/cash/transactions, or
+add a schema/migration revision.
 
 - [ ] **Step 5: Replace the CLI command and remove obsolete estimate modules**
 
