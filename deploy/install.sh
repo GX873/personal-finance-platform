@@ -79,6 +79,7 @@ fi
 python3 -m venv "$RELEASE_DIR/.venv"
 "$RELEASE_DIR/.venv/bin/python" -m pip install --upgrade pip
 "$RELEASE_DIR/.venv/bin/python" -m pip install "$RELEASE_DIR[market-analysis]"
+install -d -o root -g root -m 0755 "$RELEASE_DIR/.venv/lib/python3.12/site-packages/efinance/data"
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
 # The release is immutable application code; only state directories are writable.
@@ -106,8 +107,8 @@ chown root:adm /var/log/personal-finance
 chmod 0750 /var/log/personal-finance
 
 for unit in finance-app.service finance-daily.service finance-daily.timer \
-    finance-backup.service finance-backup.timer finance-market.service \
-    finance-market.timer; do
+    finance-backup.service finance-backup.timer finance-nav.service \
+    finance-nav.timer; do
     install -o root -g root -m 0644 "$SOURCE_DIR/deploy/$unit" \
         "/etc/systemd/system/$unit"
 done
@@ -121,12 +122,17 @@ if [[ -L /etc/nginx/sites-enabled/default ]]; then
     rm -f /etc/nginx/sites-enabled/default
 fi
 
+systemctl disable --now finance-market.timer || true
+systemctl stop finance-market.service || true
+rm -f /etc/systemd/system/finance-market.service
+rm -f /etc/systemd/system/finance-market.timer
+
 nginx -t
 systemctl daemon-reload
-systemctl enable finance-app.service finance-daily.timer finance-backup.timer
+systemctl enable finance-app.service finance-daily.timer finance-backup.timer finance-nav.timer
 systemctl enable nginx
 systemctl enable --now finance-daily.timer finance-backup.timer
-systemctl enable --now finance-market.timer
+systemctl enable --now finance-nav.timer
 systemctl reload-or-restart nginx
 
 cat <<'MESSAGE'

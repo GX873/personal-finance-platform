@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger personal finance official fund NAV refresh
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 18,20,22:00:00
+OnCalendar=Tue..Sat *-*-* 08:00:00
+Persistent=true
+Unit=finance-nav.service
+
+[Install]
+WantedBy=timers.target

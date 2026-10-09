@@ -41,21 +41,46 @@ def test_daily_timer_runs_every_five_minutes_and_consults_saved_schedule() -> No
     assert "User=financeapp" in service
 
 
-def test_market_timer_triggers_every_five_minutes_on_weekdays() -> None:
-    timer = read("finance-market.timer")
-    service = read("finance-market.service")
-    assert "OnCalendar=Mon..Fri *-*-* 09..15:00/5:00" in timer
-    assert "Persistent=false" in timer
-    assert "finance market-refresh --scheduled" in service
+def test_nav_timer_runs_at_official_sync_windows() -> None:
+    timer = read("finance-nav.timer")
+    assert "OnCalendar=Mon..Fri *-*-* 18,20,22:00:00" in timer
+    assert "OnCalendar=Tue..Sat *-*-* 08:00:00" in timer
+    assert "Persistent=true" in timer
+
+
+def test_nav_service_refreshes_with_hardened_state_only_access() -> None:
+    service = read("finance-nav.service")
+    assert "finance nav-refresh --scheduled" in service
     assert "User=financeapp" in service
+    assert "WorkingDirectory=/opt/personal-finance/current" in service
+    assert "EnvironmentFile=/etc/personal-finance/finance.env" in service
+    assert "ProtectSystem=strict" in service
     assert "MemoryMax=300M" in service
+    read_write_paths = {
+        line.split("=", 1)[1]
+        for line in service.splitlines()
+        if line.startswith("ReadWritePaths=")
+    }
+    assert read_write_paths == {"/var/lib/personal-finance/data"}
 
 
-def test_installer_enables_market_timer() -> None:
+def test_installer_enables_nav_timer_and_retires_market_units() -> None:
     script = read("install.sh")
-    assert "finance-market.service" in script
-    assert "finance-market.timer" in script
-    assert "systemctl enable --now finance-market.timer" in script
+    assert "finance-nav.service" in script
+    assert "finance-nav.timer" in script
+    assert "systemctl enable --now finance-nav.timer" in script
+    assert "systemctl disable --now finance-market.timer" in script
+    assert "systemctl stop finance-market.service" in script
+    assert 'rm -f /etc/systemd/system/finance-market.service' in script
+    assert 'rm -f /etc/systemd/system/finance-market.timer' in script
+    assert script.index("finance-market.timer") < script.index("systemctl daemon-reload")
+
+
+def test_installer_protects_efinance_data_directory_after_dependencies() -> None:
+    script = read("install.sh")
+    assert 'install -d -o root -g root -m 0755 "$RELEASE_DIR/.venv/lib/python3.12/site-packages/efinance/data"' in script
+    assert script.index('efinance/data') > script.index('pip install')
+    assert script.index('efinance/data') < script.index('chown root:root "$RELEASE_DIR"')
 
 
 def test_backup_timer_runs_online_backup_as_locked_user() -> None:
