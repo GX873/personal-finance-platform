@@ -761,8 +761,8 @@ def test_fund_center_requires_login_and_reads_only_local_data(
         raise AssertionError("GET /funds must not construct an external provider")
 
     monkeypatch.setattr(web_routes, "build_fund_center", fake_build)
-    monkeypatch.setattr(web_routes, "TiantianEstimateProvider", external_call_is_a_bug)
-    monkeypatch.setattr(web_routes, "EfinanceEstimateAdapter", external_call_is_a_bug)
+    monkeypatch.setattr(web_routes, "EastMoneyFundNavProvider", external_call_is_a_bug)
+    monkeypatch.setattr(web_routes, "EfinanceAdapter", external_call_is_a_bug)
 
     response = client.get("/funds")
     assert response.status_code == 303
@@ -951,7 +951,7 @@ def test_fund_center_css_has_stable_responsive_layout():
     assert ".fund-tabs{overflow-x:auto}" in mobile_css
 
 
-def test_manual_intraday_refresh_is_cooled_down_and_audited(
+def test_manual_official_nav_refresh_is_cooled_down_and_audited(
     client, db_session, monkeypatch
 ):
     now = datetime(2026, 9, 30, 4, 0, tzinfo=UTC)
@@ -960,8 +960,8 @@ def test_manual_intraday_refresh_is_cooled_down_and_audited(
     closed: list[bool] = []
 
     class Primary:
-        source = "tiantian:estimate"
-        source_url = "https://fundgz.1234567.com.cn/"
+        source = "eastmoney"
+        source_url = "https://api.fund.eastmoney.com/f10/lsjz"
 
         def __init__(self, *, clock):
             self.clock = clock
@@ -970,18 +970,18 @@ def test_manual_intraday_refresh_is_cooled_down_and_audited(
             provider_calls.append(code)
             return FundNavQuote(
                 value=Decimal("1.23"),
-                valuation_date=now.astimezone(web_routes.SHANGHAI).date(),
+                valuation_date=date(2026, 9, 29),
                 source=self.source,
                 source_url=self.source_url,
                 fetched_at=now,
-                quote_type=QuoteType.INTRADAY_ESTIMATE,
+                quote_type=QuoteType.OFFICIAL_NAV,
             )
 
         def close(self):
             closed.append(True)
 
     class Fallback:
-        source = "efinance:estimate"
+        source = "efinance"
         source_url = "https://example.test/efinance"
 
         def __init__(self, *, clock):
@@ -991,8 +991,8 @@ def test_manual_intraday_refresh_is_cooled_down_and_audited(
             raise AssertionError("fallback must not run after primary success")
 
     monkeypatch.setattr(web_routes, "utc_now", lambda: now)
-    monkeypatch.setattr(web_routes, "TiantianEstimateProvider", Primary)
-    monkeypatch.setattr(web_routes, "EfinanceEstimateAdapter", Fallback)
+    monkeypatch.setattr(web_routes, "EastMoneyFundNavProvider", Primary)
+    monkeypatch.setattr(web_routes, "EfinanceAdapter", Fallback)
     assert login(client).status_code == 303
     token = csrf(client, f"/funds?asset_id={asset.id}")
 
@@ -1010,12 +1010,12 @@ def test_manual_intraday_refresh_is_cooled_down_and_audited(
     assert provider_calls == [asset.code]
     assert closed == [True]
     db_session.expire_all()
-    estimate = db_session.scalar(
+    official_nav = db_session.scalar(
         select(PriceSnapshot).where(
-            PriceSnapshot.quote_type == QuoteType.INTRADAY_ESTIMATE.value
+            PriceSnapshot.quote_type == QuoteType.OFFICIAL_NAV.value
         )
     )
-    assert estimate is not None
+    assert official_nav is not None
     events = list(
         db_session.scalars(
             select(AuditEvent).where(AuditEvent.event_type == "fund.refresh_requested")
@@ -1025,7 +1025,7 @@ def test_manual_intraday_refresh_is_cooled_down_and_audited(
     details = json.loads(events[0].details_json)
     assert details["summary"] == {
         "status": "success",
-        "source": "tiantian:estimate",
+        "source": "eastmoney",
         "attempts": 1,
         "error": None,
     }
@@ -1040,8 +1040,8 @@ def test_failed_manual_refresh_uses_fallback_and_still_activates_cooldown(
     closed: list[bool] = []
 
     class Primary:
-        source = "tiantian:estimate"
-        source_url = "https://fundgz.1234567.com.cn/"
+        source = "eastmoney"
+        source_url = "https://api.fund.eastmoney.com/f10/lsjz"
 
         def __init__(self, *, clock):
             pass
@@ -1054,7 +1054,7 @@ def test_failed_manual_refresh_uses_fallback_and_still_activates_cooldown(
             closed.append(True)
 
     class Fallback:
-        source = "efinance:estimate"
+        source = "efinance"
         source_url = "https://example.test/efinance"
 
         def __init__(self, *, clock):
@@ -1065,8 +1065,8 @@ def test_failed_manual_refresh_uses_fallback_and_still_activates_cooldown(
             raise RuntimeError("fallback private body must not be audited")
 
     monkeypatch.setattr(web_routes, "utc_now", lambda: now)
-    monkeypatch.setattr(web_routes, "TiantianEstimateProvider", Primary)
-    monkeypatch.setattr(web_routes, "EfinanceEstimateAdapter", Fallback)
+    monkeypatch.setattr(web_routes, "EastMoneyFundNavProvider", Primary)
+    monkeypatch.setattr(web_routes, "EfinanceAdapter", Fallback)
     assert login(client).status_code == 303
     token = csrf(client, f"/funds?asset_id={asset.id}")
 
@@ -1087,7 +1087,7 @@ def test_failed_manual_refresh_uses_fallback_and_still_activates_cooldown(
     assert event is not None
     details = json.loads(event.details_json)
     assert details["summary"]["status"] == "failed"
-    assert details["summary"]["error"] == "estimate_unavailable"
+    assert details["summary"]["error"] == "official_nav_unavailable"
     assert "private body" not in event.details_json
 
 
@@ -1119,7 +1119,7 @@ def test_manual_refresh_requires_currently_held_cn_fund(
     db_session.commit()
     monkeypatch.setattr(
         web_routes,
-        "TiantianEstimateProvider",
+        "EastMoneyFundNavProvider",
         lambda **kwargs: pytest.fail("provider must not be constructed"),
     )
     assert login(client).status_code == 303

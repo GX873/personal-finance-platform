@@ -96,13 +96,13 @@ def test_refresh_persists_provenance_and_reports_shanghai_freshness():
         session.close()
 
 
-def test_stale_daily_nav_is_persisted_but_never_presented_as_realtime():
+def test_older_published_daily_nav_is_successful_but_not_fresh():
     session, _ = setup_session()
     try:
         evening = datetime(2026, 9, 23, 14, tzinfo=UTC)  # 22:00 Shanghai
         stale_quote = FundNavQuote(
             value=Decimal("1.2345"),
-            valuation_date=date(2026, 9, 22),
+            valuation_date=date(2026, 9, 19),
             source="eastmoney",
             source_url=SOURCE_URL,
             fetched_at=evening,
@@ -111,10 +111,10 @@ def test_stale_daily_nav_is_persisted_but_never_presented_as_realtime():
             session, StubProvider(stale_quote), clock=lambda: evening
         ).refresh("000001")
 
-        assert result.status is RefreshStatus.STALE
+        assert result.status is RefreshStatus.SUCCESS
         assert result.is_fresh is False
         assert result.snapshot is not None
-        assert result.snapshot.valuation_date == date(2026, 9, 22)
+        assert result.snapshot.valuation_date == date(2026, 9, 19)
     finally:
         session.close()
 
@@ -292,7 +292,7 @@ def test_refresh_with_fallback_uses_efinance_after_primary_failure():
         session.close()
 
 
-def test_refresh_with_fallback_uses_fresh_fallback_after_stale_primary():
+def test_refresh_with_fallback_accepts_older_primary_without_calling_fallback():
     session, _ = setup_session()
     try:
         primary = StubProvider(quote(date(2026, 9, 19)))
@@ -312,43 +312,12 @@ def test_refresh_with_fallback_uses_fresh_fallback_after_stale_primary():
 
         assert result.status is RefreshStatus.SUCCESS
         assert result.snapshot is not None
-        assert result.snapshot.source == "efinance"
-        assert primary.calls == ["000001"]
-        assert fallback.calls == ["000001"]
-        assert [attempt.status for attempt in result.provider_attempts] == [
-            RefreshStatus.STALE,
-            RefreshStatus.SUCCESS,
-        ]
-    finally:
-        session.close()
-
-
-def test_refresh_with_fallback_reports_failure_when_all_official_navs_are_stale():
-    session, _ = setup_session()
-    try:
-        primary = StubProvider(quote(date(2026, 9, 18)))
-        fallback = EfinanceStubProvider(
-            quote=FundNavQuote(
-                value=Decimal("1.25"),
-                valuation_date=date(2026, 9, 19),
-                source="efinance",
-                source_url=EfinanceStubProvider.source_url,
-                fetched_at=NOW,
-            )
-        )
-
-        result = FundPriceService(
-            session, primary, clock=lambda: NOW
-        ).refresh_with_fallback("000001", [primary, fallback])
-
-        assert result.status is RefreshStatus.FAILED
         assert result.is_fresh is False
-        assert result.last_good_snapshot is not None
-        assert result.last_good_snapshot.source == "efinance"
-        assert result.last_good_price == Decimal("1.25000000")
+        assert result.snapshot.source == "eastmoney"
+        assert primary.calls == ["000001"]
+        assert fallback.calls == []
         assert [attempt.status for attempt in result.provider_attempts] == [
-            RefreshStatus.STALE,
-            RefreshStatus.STALE,
+            RefreshStatus.SUCCESS,
         ]
     finally:
         session.close()

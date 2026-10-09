@@ -282,3 +282,31 @@ def test_nav_refresh_cli_closes_primary_and_sanitizes_internal_error(
     assert captured.out == ""
     assert captured.err.strip() == "nav-refresh status=failed error=internal_error"
     assert "sensitive" not in captured.err
+
+
+def test_nav_refresh_cli_sanitizes_primary_close_error(monkeypatch, capsys):
+    class Primary:
+        def close(self):
+            raise RuntimeError("sensitive close failure")
+
+    class Job:
+        def __init__(self, session, *, providers):
+            pass
+
+        def run_scheduled(self):
+            return NavSyncResult("success", 1, 1, 0, 0)
+
+    monkeypatch.setattr(
+        "finance_app.cli.get_session_factory",
+        lambda: lambda: nullcontext("session"),
+    )
+    monkeypatch.setattr("finance_app.cli.EastMoneyFundNavProvider", Primary)
+    monkeypatch.setattr("finance_app.cli.EfinanceAdapter", lambda: object())
+    monkeypatch.setattr("finance_app.cli.OfficialNavSyncJob", Job)
+
+    assert main(["nav-refresh", "--scheduled"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "nav-refresh status=failed error=internal_error"
+    assert "sensitive" not in captured.err

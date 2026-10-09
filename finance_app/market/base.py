@@ -85,7 +85,3 @@ class FundNavProvider(Protocol):
     source_url: str
 
     def fetch(self, fund_code: str) -> FundNavQuote: ...
-
-
-class IntradayEstimateProvider(FundNavProvider, Protocol):
-    """Provider whose fetch result must be an intraday estimate."""

@@ -216,7 +216,7 @@ class FundPriceService:
             )
 
         return RefreshResult(
-            status=RefreshStatus.SUCCESS if fresh else RefreshStatus.STALE,
+            status=RefreshStatus.SUCCESS,
             is_fresh=fresh,
             snapshot=snapshot,
             last_good_snapshot=snapshot,

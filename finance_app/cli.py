@@ -1241,18 +1241,18 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with get_session_factory()() as db:
                 primary = EastMoneyFundNavProvider()
-                result = OfficialNavSyncJob(
-                    db, providers=[primary, EfinanceAdapter()]
-                ).run_scheduled()
+                try:
+                    result = OfficialNavSyncJob(
+                        db, providers=[primary, EfinanceAdapter()]
+                    ).run_scheduled()
+                finally:
+                    primary.close()
         except Exception:  # noqa: BLE001 - sanitize the CLI boundary
             print(
                 "nav-refresh status=failed error=internal_error",
                 file=sys.stderr,
             )
             return 1
-        finally:
-            if primary is not None:
-                primary.close()
         print(
             f"nav-refresh status={result.status} attempted={result.attempted} "
             f"succeeded={result.succeeded} unchanged={result.unchanged} "

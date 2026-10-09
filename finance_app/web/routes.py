@@ -36,9 +36,9 @@ from finance_app.ledger.schemas import PostTransaction
 from finance_app.ledger.service import post_transaction, reverse_transaction
 from finance_app.market.analytics import Period
 from finance_app.market.base import QuoteType
-from finance_app.market.efinance_adapter import EfinanceEstimateAdapter
+from finance_app.market.eastmoney import EastMoneyFundNavProvider
+from finance_app.market.efinance_adapter import EfinanceAdapter
 from finance_app.market.service import FundPriceService, RefreshResult, RefreshStatus
-from finance_app.market.tiantian_estimate import TiantianEstimateProvider
 from finance_app.notifications.models import AppSetting, NotificationChannel
 from finance_app.ops.backup import backup_directory, recent_backup_statuses
 from finance_app.portfolio.models import (
@@ -418,7 +418,7 @@ def _refresh_audit_event(
             "error": (
                 None
                 if result.status is RefreshStatus.SUCCESS
-                else "estimate_unavailable"
+                else "official_nav_unavailable"
             ),
         },
     )
@@ -977,7 +977,7 @@ async def reverse_manual_transaction(
 
 
 @router.post("/funds/{asset_id}/refresh", dependencies=[Depends(require_csrf)])
-def refresh_fund_estimate(
+def refresh_fund_official_nav(
     asset_id: int,
     request: Request,
     db: Annotated[Session, Depends(get_db)],
@@ -990,12 +990,12 @@ def refresh_fund_estimate(
             f"/funds?asset_id={asset.id}&refresh=cooldown", status_code=303
         )
 
-    primary = TiantianEstimateProvider(clock=utc_now)
+    primary = EastMoneyFundNavProvider(clock=utc_now)
     try:
         result = FundPriceService(db, primary, clock=utc_now).refresh_with_fallback(
             asset.code,
-            [primary, EfinanceEstimateAdapter(clock=utc_now)],
-            required_quote_type=QuoteType.INTRADAY_ESTIMATE,
+            [primary, EfinanceAdapter(clock=utc_now)],
+            required_quote_type=QuoteType.OFFICIAL_NAV,
         )
         db.add(
             _refresh_audit_event(

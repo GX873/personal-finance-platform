@@ -83,23 +83,3 @@ class EfinanceAdapter:
             if code and 0 <= weight_bps <= 10000:
                 result[code] = weight_bps
         return result
-
-
-class EfinanceEstimateAdapter(EfinanceAdapter):
-    source = "efinance:estimate"
-    source_url = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo"
-
-    def fetch(self, fund_code: str) -> FundNavQuote:
-        rows = self._fund_client().get_realtime_increase_rate(fund_code)
-        if rows is None or len(rows.index) == 0:
-            raise RuntimeError("efinance returned no estimate rows")
-        row = rows.iloc[0]
-        raw_value = row.get("估算净值") or row.get("单位净值")
-        return FundNavQuote(
-            value=Decimal(str(raw_value)),
-            valuation_date=self._clock().astimezone().date(),
-            source=self.source,
-            source_url=self.source_url,
-            fetched_at=self._clock(),
-            quote_type=QuoteType.INTRADAY_ESTIMATE,
-        )
