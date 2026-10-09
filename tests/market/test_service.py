@@ -115,6 +115,7 @@ def test_older_published_daily_nav_is_successful_but_not_fresh():
         assert result.is_fresh is False
         assert result.snapshot is not None
         assert result.snapshot.valuation_date == date(2026, 9, 19)
+        assert session.scalar(select(func.count()).select_from(AuditEvent)) == 0
     finally:
         session.close()
 
@@ -319,6 +320,90 @@ def test_refresh_with_fallback_accepts_older_primary_without_calling_fallback():
         assert [attempt.status for attempt in result.provider_attempts] == [
             RefreshStatus.SUCCESS,
         ]
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize(
+    ("valuation_date", "fetched_at", "reference"),
+    [
+        (date(2026, 9, 22), NOW + timedelta(minutes=1), NOW),
+        (date(2026, 9, 24), NOW, NOW),
+        (date(2026, 9, 24), NOW, NOW + timedelta(days=3)),
+    ],
+    ids=(
+        "future-fetched-at",
+        "future-valuation-date",
+        "valuation-date-after-fetched-date",
+    ),
+)
+def test_impossible_quote_time_fails_without_persistence_and_uses_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    valuation_date: date,
+    fetched_at: datetime,
+    reference: datetime,
+):
+    session, _ = setup_session()
+    try:
+        primary = StubProvider(
+            FundNavQuote(
+                value=Decimal("1.24"),
+                valuation_date=valuation_date,
+                source="eastmoney",
+                source_url=SOURCE_URL,
+                fetched_at=fetched_at,
+            )
+        )
+        fallback = EfinanceStubProvider(
+            quote=FundNavQuote(
+                value=Decimal("1.25"),
+                valuation_date=date(2026, 9, 22),
+                source="efinance",
+                source_url=EfinanceStubProvider.source_url,
+                fetched_at=NOW,
+            )
+        )
+        recalculations = 0
+
+        def record_recalculation(*args, **kwargs):
+            nonlocal recalculations
+            recalculations += 1
+
+        monkeypatch.setattr(
+            "finance_app.market.service.refresh_current_snapshot_after_price_update",
+            record_recalculation,
+        )
+
+        result = FundPriceService(
+            session, primary, clock=lambda: reference
+        ).refresh_with_fallback("000001", [primary, fallback])
+
+        assert result.status is RefreshStatus.SUCCESS
+        assert result.snapshot is not None
+        assert result.snapshot.source == "efinance"
+        assert primary.calls == ["000001"]
+        assert fallback.calls == ["000001"]
+        assert [attempt.status for attempt in result.provider_attempts] == [
+            RefreshStatus.FAILED,
+            RefreshStatus.SUCCESS,
+        ]
+        assert recalculations == 1
+        snapshots = list(session.scalars(select(PriceSnapshot)))
+        assert [snapshot.source for snapshot in snapshots] == ["efinance"]
+        audit = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == "market_price_refresh_failed"
+            )
+        )
+        assert audit is not None
+        assert json.loads(audit.details_json or "") == {
+            "source": "eastmoney",
+            "source_url": SOURCE_URL,
+            "fetched_at": fetched_at.isoformat(),
+            "attempts": 1,
+            "error_code": "invalid_quote_time",
+            "error_text": "invalid_quote_time: provider returned impossible timestamps",
+        }
     finally:
         session.close()
 

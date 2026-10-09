@@ -18,7 +18,7 @@ from finance_app.market.base import (
     QuoteType,
 )
 from finance_app.portfolio.models import PriceSnapshot
-from finance_app.portfolio.rules import nav_is_fresh
+from finance_app.portfolio.rules import SHANGHAI, nav_is_fresh
 from finance_app.portfolio.service import (
     price_selection_key,
     refresh_current_snapshot_after_price_update,
@@ -186,6 +186,44 @@ class FundPriceService:
             )
 
         reference = self._clock()
+        if (
+            quote.fetched_at > reference
+            or quote.valuation_date > reference.astimezone(SHANGHAI).date()
+            or quote.valuation_date > quote.fetched_at.astimezone(SHANGHAI).date()
+        ):
+            summary = "invalid_quote_time: provider returned impossible timestamps"
+            self._session.add(
+                AuditEvent(
+                    event_type="market_price_refresh_failed",
+                    entity_type="asset",
+                    entity_id=asset.id,
+                    details_json=json.dumps(
+                        {
+                            "source": quote.source,
+                            "source_url": quote.source_url,
+                            "fetched_at": quote.fetched_at.isoformat(),
+                            "attempts": quote.attempts,
+                            "error_code": "invalid_quote_time",
+                            "error_text": summary,
+                        },
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+            self._session.flush()
+            return RefreshResult(
+                status=RefreshStatus.FAILED,
+                is_fresh=False,
+                snapshot=None,
+                last_good_snapshot=last_good,
+                last_good_price=last_good.price if last_good is not None else None,
+                source=quote.source,
+                source_url=quote.source_url,
+                fetched_at=quote.fetched_at,
+                attempts=quote.attempts,
+                error_summary=summary,
+            )
         fresh = nav_is_fresh(quote.valuation_date, quote.fetched_at, reference)
         snapshot = self._session.scalar(
             select(PriceSnapshot).where(
