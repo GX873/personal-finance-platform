@@ -94,14 +94,54 @@ sudo -u financeapp .venv/bin/finance daily-check --scheduled --dry-run
 
 The dry run performs no HTTP requests, notifications, or persistent changes.
 Advice is conditional whenever prices, holdings, or cash are missing or stale.
+The normal 14:00 advice run also reads official NAV observations already stored
+in the database; it has no live market-provider dependency. The notification
+prints the actual official valuation date instead of implying that a value was
+published on the reminder date. Only official NAV observations contribute to
+totals, charts, risk metrics, and reminders.
+
+## Official NAV synchronization
+
+`finance-nav.timer` runs independently of the advice timer. Its schedules use
+the server's configured `Asia/Shanghai` timezone:
+
+- Monday through Friday at 18:00, 20:00, and 22:00;
+- Tuesday through Saturday at 08:00 to pick up delayed publication.
+
+The synchronization job requests EastMoney first. It uses `efinance` only
+after the primary provider fails or returns invalid data. A valid official NAV
+with an older valuation date is a successful observation and normally means
+the fund company has not published a newer value yet; do not change its date
+or force the fallback provider merely to obtain a newer-looking date.
+
+Inspect the timer and bounded service output with:
+
+```bash
+systemctl status finance-nav.timer --no-pager
+systemctl list-timers finance-nav.timer --all --no-pager
+journalctl -u finance-nav.service --since today --no-pager
+```
+
+Run one synchronization on demand with:
+
+```bash
+systemctl start finance-nav.service
+systemctl status finance-nav.service --no-pager
+```
+
+The service reports attempted, succeeded, unchanged, and failed counts. A
+repeat observation for the same source and valuation date is unchanged rather
+than a duplicate. Provider failures do not authorize changing holdings, cash,
+cost basis, or transactions.
 
 ## Manual NAV entry
 
-Use the authenticated Prices page only when a reliable dated source is
-available. Enter the fund code, NAV, valuation date, source, and fetched time;
-never backdate an observation to hide a stale quote. The EastMoney adapter is
-preferred for supported funds. A manually entered value must be reviewed by a
-human before the next daily check and remains traceable in the audit log.
+Manual NAV is an exceptional correction path, not part of routine operation.
+Use the authenticated Prices page only after automatic providers keep failing
+and a reliable dated source is available. Enter the fund code, NAV, valuation
+date, source, and fetched time; never backdate an observation to hide normal
+publication lag. A manually entered value must be reviewed by a human before
+the next daily check and remains traceable in the audit log.
 
 ## Backups and restore-check
 
@@ -260,9 +300,10 @@ Tailscale state or relax public firewall rules while diagnosing the failure.
 
 `finance-daily.timer` 每五分钟唤醒一次任务，应用按设置页中的北京时间判断是否到达提醒窗口。默认时间为 14:00；周六、周日及 `cn_holidays` 中配置的日期返回 `not-due`。工资和投资预算周期从每月 15 日开始，到次月 14 日结束。
 
-正式净值与盘中估算分开保存。行情适配器失败时任务降级为 `WAIT_FOR_DATA`，不得用旧估算值生成买入或卖出建议。特殊机会每个工资周期最多记录一次，且不能令储备金低于 900 元。
+14:00 建议任务只读取数据库中已经保存的官方净值，不会现场调用行情提供方。提醒会显示实际净值日期；基金公司尚未发布更新数据时，较旧的官方净值日期属于正常发布延迟。只有官方净值参与总资产、图表、风险指标和提醒计算；数据缺失或过期时任务降级为 `WAIT_FOR_DATA`。特殊机会每个工资周期最多记录一次，且不能令储备金低于 900 元。
 
-正式净值刷新顺序为主行情源、`efinance` 回退源。仅当两个来源都失败时，
-系统才在提醒中要求手工补录，并显示基金代码、最后有效净值日期和失败来源；
-不会生成虚构价格。自动写入正式净值后，当前组合快照会重新估值，但不会因此
-自动确认现金或持仓。
+官方净值由 `finance-nav.timer` 在北京时间周一至周五 18:00、20:00、22:00，
+以及周二至周六 08:00 独立同步。同步顺序为东方财富主提供方；仅在提供方失败
+或返回无效数据后才使用 `efinance`。只有自动提供方持续失败并经人工核对可靠
+来源后，才通过手工净值页面进行例外纠正。自动写入官方净值后，当前组合快照会
+重新估值，但不会因此自动确认现金或持仓。
