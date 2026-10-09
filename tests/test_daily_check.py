@@ -17,7 +17,6 @@ from finance_app.ledger.models import (
     PortfolioRole,
     Transaction,
 )
-from finance_app.market.service import ProviderAttempt, RefreshResult, RefreshStatus
 from finance_app.notifications.base import DeliveryResult, DeliveryStatus, Notification
 from finance_app.notifications.models import (
     AppSetting,
@@ -26,7 +25,6 @@ from finance_app.notifications.models import (
     NotificationDelivery,
 )
 from finance_app.portfolio.models import (
-    Alert,
     AllocationTarget,
     OpportunityAlert,
     PortfolioSnapshot,
@@ -47,10 +45,6 @@ class RecordingDailyCheck(DailyCheck):
         self.events: list[str] = []
         self.notifications: list[tuple[str, str]] = []
         self.fail_notification = fail_notification
-
-    def refresh_prices(self, business_date):
-        self.events.append("refresh_prices")
-        return []
 
     def validate_freshness(self, business_date):
         self.events.append("validate_freshness")
@@ -95,9 +89,6 @@ class CriticalRecordingDailyCheck(RecordingDailyCheck):
 
 
 class NoNetworkDailyCheck(DailyCheck):
-    def refresh_prices(self, business_date):
-        return []
-
     def notify(self, notification, *, critical=False):
         return DeliveryStatus.SUCCESS
 
@@ -107,9 +98,6 @@ class RealRuleRecordingDailyCheck(DailyCheck):
         super().__init__(*args, **kwargs)
         self.advice: list[Advice] = []
         self.notifications: list[tuple[str, bool]] = []
-
-    def refresh_prices(self, business_date):
-        return []
 
     def evaluate_rules(self, snapshot, freshness):
         self.advice = super().evaluate_rules(snapshot, freshness)
@@ -142,189 +130,6 @@ class StubNotifier:
         return self.result
 
 
-def test_refresh_prices_closes_owned_provider_after_success(db_session, monkeypatch):
-    db_session.add(
-        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
-    )
-    db_session.flush()
-
-    class Provider:
-        closed = False
-
-        def close(self):
-            self.closed = True
-
-    provider = Provider()
-
-    class Service:
-        def __init__(self, session, actual_provider, *, clock):
-            assert session is db_session
-            assert actual_provider is provider
-
-        def refresh_with_fallback(self, code, providers):
-            return code
-
-    monkeypatch.setattr(
-        "finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: provider
-    )
-    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
-
-    result = DailyCheck(db_session, clock=lambda: NOW).refresh_prices(
-        date(2026, 9, 23)
-    )
-
-    assert result == ["000001"]
-    assert provider.closed is True
-
-
-def test_refresh_prices_closes_owned_provider_after_unexpected_error(
-    db_session, monkeypatch
-):
-    db_session.add(
-        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
-    )
-    db_session.flush()
-
-    class Provider:
-        closed = False
-
-        def close(self):
-            self.closed = True
-
-    provider = Provider()
-
-    class Service:
-        def __init__(self, session, actual_provider, *, clock):
-            pass
-
-        def refresh_with_fallback(self, code, providers):
-            raise RuntimeError("unexpected refresh failure")
-
-    monkeypatch.setattr(
-        "finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: provider
-    )
-    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
-
-    with pytest.raises(RuntimeError, match="unexpected refresh failure"):
-        DailyCheck(db_session, clock=lambda: NOW).refresh_prices(date(2026, 9, 23))
-
-    assert provider.closed is True
-
-
-def test_failed_official_sources_create_one_manual_recovery_alert(
-    db_session, monkeypatch
-):
-    db_session.add(
-        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
-    )
-    db_session.flush()
-
-    class Provider:
-        closed = False
-        source = "eastmoney"
-        source_url = "https://example.test/eastmoney"
-
-        def close(self):
-            self.closed = True
-
-    provider = Provider()
-    failed = RefreshResult(
-        status=RefreshStatus.FAILED,
-        is_fresh=False,
-        snapshot=None,
-        last_good_snapshot=None,
-        last_good_price=None,
-        source="efinance",
-        source_url="https://example.test/efinance",
-        fetched_at=NOW,
-        attempts=1,
-        error_summary="all NAV providers failed",
-        provider_attempts=(
-            ProviderAttempt("eastmoney", RefreshStatus.FAILED, "timeout"),
-            ProviderAttempt("efinance", RefreshStatus.FAILED, "unavailable"),
-        ),
-    )
-
-    class Service:
-        def __init__(self, session, actual_provider, *, clock):
-            pass
-
-        def refresh_with_fallback(self, code, providers):
-            return failed
-
-    monkeypatch.setattr("finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: provider)
-    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
-    monkeypatch.setattr(DailyCheck, "_backfill_history", lambda *args: 0)
-
-    check = DailyCheck(db_session, clock=lambda: NOW)
-    check.refresh_prices(date(2026, 9, 23))
-    check.refresh_prices(date(2026, 9, 23))
-
-    alerts = list(db_session.scalars(select(Alert)))
-    assert len(alerts) == 1
-    assert "000001" in alerts[0].message
-    assert "手工补录" in alerts[0].message
-    assert "未生成数值" in alerts[0].message
-    assert "1.234" not in alerts[0].message
-
-
-def test_manual_recovery_alert_is_idempotent_per_asset_and_business_date(
-    db_session, monkeypatch
-):
-    db_session.add(
-        Asset(code="000001", market="CN", name="Fund", asset_class="fund")
-    )
-    db_session.flush()
-
-    class Provider:
-        source = "eastmoney"
-        source_url = "https://example.test/eastmoney"
-
-        def close(self):
-            pass
-
-    failed = RefreshResult(
-        status=RefreshStatus.FAILED,
-        is_fresh=False,
-        snapshot=None,
-        last_good_snapshot=None,
-        last_good_price=None,
-        source="efinance",
-        source_url="https://example.test/efinance",
-        fetched_at=NOW,
-        attempts=2,
-        error_summary="no fresh official NAV",
-        provider_attempts=(
-            ProviderAttempt("eastmoney", RefreshStatus.STALE, None),
-            ProviderAttempt("efinance", RefreshStatus.FAILED, "unavailable"),
-        ),
-    )
-
-    class Service:
-        def __init__(self, session, actual_provider, *, clock):
-            pass
-
-        def refresh_with_fallback(self, code, providers):
-            return failed
-
-    monkeypatch.setattr("finance_app.cli.EastMoneyFundNavProvider", lambda *, clock: Provider())
-    monkeypatch.setattr("finance_app.cli.FundPriceService", Service)
-    monkeypatch.setattr(DailyCheck, "_backfill_history", lambda *args: 0)
-
-    check = DailyCheck(db_session, clock=lambda: NOW)
-    check.refresh_prices(date(2026, 9, 22))
-    check.refresh_prices(date(2026, 9, 22))
-    check.refresh_prices(date(2026, 9, 23))
-
-    alerts = list(db_session.scalars(select(Alert).order_by(Alert.id)))
-    assert len(alerts) == 2
-    assert "业务日期：2026-09-22" in alerts[0].message
-    assert "业务日期：2026-09-23" in alerts[1].message
-    assert [alert.alert_type for alert in alerts] == ["price", "price"]
-    assert "eastmoney:过期" in alerts[0].message
-    assert "efinance:失败" in alerts[0].message
-
-
 def test_daily_check_orders_freshness_before_advice(db_session):
     check = RecordingDailyCheck(db_session, clock=lambda: NOW)
 
@@ -332,11 +137,75 @@ def test_daily_check_orders_freshness_before_advice(db_session):
 
     assert result is DailyCheckResult.SUCCESS
     assert check.events == [
-        "refresh_prices",
         "validate_freshness",
         "snapshot",
         "evaluate_rules",
         "notify",
+    ]
+
+
+def test_daily_check_uses_stored_nav_without_constructing_market_providers(
+    db_session, monkeypatch
+):
+    account = Account(name="Broker", kind="investment")
+    asset = Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Holding(
+                account_id=account.id,
+                asset_id=asset.id,
+                quantity=Decimal(100),
+                updated_at=NOW,
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 9, 22),
+                source="eastmoney",
+                price=Decimal("1.234"),
+                quote_type="official_nav",
+                fetched_at=NOW - timedelta(hours=1),
+            ),
+            CashBucket(bucket_kind="reserve", balance_cents=0, updated_at=NOW),
+            CashBucket(bucket_kind="investment", balance_cents=0, updated_at=NOW),
+        ]
+        + [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+    )
+    db_session.commit()
+
+    def reject_provider(*args, **kwargs):
+        raise AssertionError("daily advice must not construct market providers")
+
+    monkeypatch.setattr(
+        "finance_app.cli.EastMoneyFundNavProvider", reject_provider
+    )
+    monkeypatch.setattr("finance_app.cli.EfinanceAdapter", reject_provider)
+    notifications = []
+    monkeypatch.setattr(
+        DailyCheck,
+        "notify",
+        lambda self, notification, **kwargs: (
+            notifications.append(notification) or DeliveryStatus.SUCCESS
+        ),
+    )
+
+    result = DailyCheck(db_session, clock=lambda: NOW).run(date(2026, 9, 23))
+
+    assert result is DailyCheckResult.SUCCESS
+    assert db_session.scalar(select(JobRun)).status == "success"
+    assert db_session.scalar(select(PortfolioSnapshot)).data_complete is True
+    assert [item.title for item in notifications] == [
+        "2026-09-23 每日理财摘要",
+        "2026-09-23 重大风险提醒",
     ]
 
 
@@ -354,6 +223,7 @@ def test_daily_digest_combines_general_advice_and_discloses_unknown_data(db_sess
         "现金桶",
         "数据时间",
         "数据来源：未知",
+        "官方净值日期：未知",
         "行动：WAIT_FOR_DATA",
         "金额：未知",
         "比例：未知",
@@ -579,6 +449,55 @@ def test_freshness_prefers_manual_nav_over_newer_same_day_automatic_source(
 
     assert freshness["sources"] == ["manual:user-entry"]
     assert freshness["price_as_of"] == NOW - timedelta(minutes=5)
+    assert freshness["nav_dates"] == [date(2026, 9, 22)]
+
+
+@pytest.mark.parametrize(
+    ("valuation_dates", "expected_label"),
+    [
+        ([date(2026, 9, 22), date(2026, 9, 22)], "官方净值日期：2026-09-22"),
+        (
+            [date(2026, 9, 21), date(2026, 9, 22)],
+            "官方净值日期：2026-09-21 至 2026-09-22",
+        ),
+    ],
+)
+def test_digest_labels_selected_official_nav_dates(
+    db_session, valuation_dates, expected_label
+):
+    account = Account(name="Broker", kind="investment")
+    assets = [
+        Asset(code=f"00000{index}", market="CN", name=f"Fund {index}", asset_class="fund")
+        for index in (1, 2)
+    ]
+    db_session.add_all([account, *assets])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Holding(account_id=account.id, asset_id=asset.id, quantity=Decimal(1))
+            for asset in assets
+        ]
+        + [
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=valuation_date,
+                source="eastmoney",
+                price=Decimal("1.2"),
+                quote_type="official_nav",
+                fetched_at=NOW - timedelta(hours=1),
+            )
+            for asset, valuation_date in zip(assets, valuation_dates, strict=True)
+        ]
+    )
+    db_session.flush()
+    check = DailyCheck(db_session, clock=lambda: NOW)
+
+    freshness = check.validate_freshness(date(2026, 9, 23))
+    body = check.build_digest(date(2026, 9, 23), None, freshness, []).body
+
+    assert body.splitlines()[4] == expected_label
+    assert "今日收盘净值" not in body
+    assert "请手工补录" not in body
 
 
 def test_allocation_targets_trigger_satellite_reduction(db_session):

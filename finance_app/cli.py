@@ -10,7 +10,7 @@ from enum import StrEnum
 from getpass import getpass
 from typing import Any
 
-from sqlalchemy import func, inspect, select, update
+from sqlalchemy import inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -30,11 +30,9 @@ from finance_app.ledger.models import (
     RiskLevel,
     Transaction,
 )
-from finance_app.market.base import FundNavProvider
 from finance_app.market.eastmoney import EastMoneyFundNavProvider
 from finance_app.market.efinance_adapter import EfinanceAdapter
 from finance_app.market.nav_job import OfficialNavSyncJob
-from finance_app.market.service import FundPriceService, RefreshResult, RefreshStatus
 from finance_app.notifications.base import DeliveryStatus, Notification
 from finance_app.notifications.email import EmailNotifier
 from finance_app.notifications.models import (
@@ -198,7 +196,6 @@ class DailyCheck:
         self._claim_id = job.id
         self._claim_started_at = job.started_at
         try:
-            self.refresh_prices(business_date)
             freshness = self.validate_freshness(business_date)
             snapshot = self.create_snapshot(business_date, freshness)
             advice = self.evaluate_rules(snapshot, freshness)
@@ -298,142 +295,6 @@ class DailyCheck:
         self.session.commit()
         return True
 
-    def refresh_prices(self, business_date: date) -> list[Any]:
-        results: list[Any] = []
-        provider = EastMoneyFundNavProvider(clock=self.clock)
-        history_provider = EfinanceAdapter(clock=self.clock)
-        try:
-            service = FundPriceService(self.session, provider, clock=self.clock)
-            providers: list[FundNavProvider] = [provider, history_provider]
-            fund_codes = self.session.scalars(
-                select(Asset.code)
-                .where(Asset.market == "CN", Asset.asset_class == "fund")
-                .order_by(Asset.code)
-            )
-            for code in fund_codes:
-                result = service.refresh_with_fallback(code, providers)
-                results.append(result)
-                if isinstance(result, RefreshResult) and result.status is RefreshStatus.FAILED:
-                    self._record_manual_nav_recovery(code, business_date, result)
-                self._backfill_history(code, business_date, history_provider)
-            return results
-        finally:
-            provider.close()
-
-    def _record_manual_nav_recovery(
-        self, fund_code: str, business_date: date, result: RefreshResult
-    ) -> None:
-        asset = self.session.scalar(
-            select(Asset).where(
-                Asset.code == fund_code,
-                Asset.market == "CN",
-                Asset.asset_class == "fund",
-            )
-        )
-        if asset is None:
-            return
-        asset_marker = f"（{asset.code}）"
-        date_marker = f"业务日期：{business_date.isoformat()}；"
-        existing = self.session.scalar(
-            select(Alert).where(
-                Alert.alert_type == "price",
-                Alert.message.contains(asset_marker),
-                Alert.message.contains(date_marker),
-            )
-        )
-        if existing is not None:
-            return
-        last_date = (
-            result.last_good_snapshot.valuation_date.isoformat()
-            if result.last_good_snapshot is not None
-            else "无"
-        )
-        sources = ", ".join(
-            f"{item.source}:{'过期' if item.status is RefreshStatus.STALE else '失败'}"
-            for item in result.provider_attempts
-        ) or "自动来源失败"
-        self.session.add(
-            Alert(
-                alert_type="price",
-                severity="warning",
-                message=(
-                    f"需要手工补录基金净值：{asset.name}{asset_marker}。"
-                    f"{date_marker}"
-                    f"最后有效净值日期：{last_date}；{sources}。"
-                    "未生成数值，请在净值页面核对后录入。"
-                ),
-            )
-        )
-        self.session.flush()
-
-    def _backfill_history(
-        self,
-        fund_code: str,
-        business_date: date,
-        provider: EfinanceAdapter,
-    ) -> int:
-        asset = self.session.scalar(
-            select(Asset).where(
-                Asset.code == fund_code,
-                Asset.market == "CN",
-                Asset.asset_class == "fund",
-            )
-        )
-        if asset is None:
-            return 0
-        count = self.session.scalar(
-            select(func.count()).select_from(PriceSnapshot).where(
-                PriceSnapshot.asset_id == asset.id,
-                PriceSnapshot.quote_type == "official_nav",
-                PriceSnapshot.error_text.is_(None),
-            )
-        )
-        if count is not None and count >= 250:
-            return 0
-        try:
-            quotes = provider.fetch_history(fund_code, limit=500)
-        except Exception:  # noqa: BLE001 - optional provider failures degrade safely
-            self.session.add(
-                AuditEvent(
-                    event_type="market_history_refresh_failed",
-                    entity_type="asset",
-                    entity_id=asset.id,
-                    details_json=json.dumps(
-                        {"source": provider.source, "error_code": "history_unavailable"},
-                        separators=(",", ":"),
-                    ),
-                )
-            )
-            return 0
-        inserted = 0
-        for quote in quotes:
-            if quote.valuation_date > business_date:
-                continue
-            existing = self.session.scalar(
-                select(PriceSnapshot.id).where(
-                    PriceSnapshot.asset_id == asset.id,
-                    PriceSnapshot.valuation_date == quote.valuation_date,
-                    PriceSnapshot.source == quote.source,
-                    PriceSnapshot.quote_type == quote.quote_type,
-                )
-            )
-            if existing is not None:
-                continue
-            self.session.add(
-                PriceSnapshot(
-                    asset_id=asset.id,
-                    valuation_date=quote.valuation_date,
-                    source=quote.source,
-                    price=quote.value,
-                    quote_type=quote.quote_type,
-                    source_url=quote.source_url,
-                    fetched_at=quote.fetched_at,
-                )
-            )
-            inserted += 1
-        self.session.flush()
-        return inserted
-
     def validate_freshness(self, business_date: date) -> dict[str, Any]:
         now = self._reference_time(business_date)
         holdings = list(
@@ -491,6 +352,7 @@ class DailyCheck:
             "holdings_as_of": holdings_as_of,
             "cash_as_of": cash_as_of,
             "sources": sorted({row.source for row in price_rows}),
+            "nav_dates": sorted({row.valuation_date for row in price_rows}),
         }
 
     def create_snapshot(
@@ -946,6 +808,13 @@ class DailyCheck:
             or "未知"
         )
         source_text = "、".join(summary_freshness["sources"]) or "未知"
+        nav_dates = summary_freshness.get("nav_dates") or []
+        if not nav_dates:
+            nav_date_text = "未知"
+        elif len(nav_dates) == 1:
+            nav_date_text = nav_dates[0].isoformat()
+        else:
+            nav_date_text = f"{nav_dates[0].isoformat()} 至 {nav_dates[-1].isoformat()}"
         domain_times = "；".join(
             f"{label}="
             + (
@@ -972,6 +841,7 @@ class DailyCheck:
             f"现金桶：{bucket_text}",
             f"数据时间：{domain_times}",
             f"数据来源：{source_text}",
+            f"官方净值日期：{nav_date_text}",
         ]
         if any(
             item.action is AdviceAction.REDUCE_IN_BATCHES
