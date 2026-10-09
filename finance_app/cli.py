@@ -22,7 +22,6 @@ from finance_app.db import get_session_factory, utc_now
 from finance_app.ledger.budget import BucketKind, cycle_allocation, salary_cycle
 from finance_app.ledger.models import (
     Asset,
-    AuditEvent,
     CashBucket,
     Holding,
     MonthlyBudget,
@@ -573,7 +572,6 @@ class DailyCheck:
         snapshot: PortfolioSnapshot | None,
         freshness: dict[str, Any],
         business_date: date,
-        position_provider: EfinanceAdapter | None = None,
     ) -> list[Advice]:
         """Screen tracked, unheld funds; never invent missing overlap or history."""
         if (
@@ -606,7 +604,6 @@ class DailyCheck:
                 )
             )
         )
-        position_provider = position_provider or EfinanceAdapter()
         targets = {
             row.name: row for row in self.session.scalars(select(AllocationTarget))
         }
@@ -668,37 +665,7 @@ class DailyCheck:
             drawdown_bps = int((peak - latest) / peak * 10000) if peak else 0
             overlap_bps = 0
             if held_funds:
-                try:
-                    candidate_positions = position_provider.fetch_positions(asset.code)
-                    held_positions = [
-                        position_provider.fetch_positions(row.code) for row in held_funds
-                    ]
-                except Exception:  # noqa: BLE001 - optional provider is a hard boundary
-                    candidate_positions = {}
-                    held_positions = []
-                    self.session.add(
-                        AuditEvent(
-                            event_type="fund_overlap_refresh_failed",
-                            entity_type="asset",
-                            entity_id=asset.id,
-                            details_json=json.dumps(
-                                {
-                                    "source": position_provider.source,
-                                    "error_code": "positions_unavailable",
-                                },
-                                separators=(",", ":"),
-                            ),
-                        )
-                    )
-                if not candidate_positions or any(not item for item in held_positions):
-                    continue
-                overlap_bps = max(
-                    sum(
-                        min(weight, positions.get(code, 0))
-                        for code, weight in candidate_positions.items()
-                    )
-                    for positions in held_positions
-                )
+                continue
             decision = evaluate_opportunity(
                 OpportunityCandidate(
                     code=asset.code,
@@ -809,6 +776,20 @@ class DailyCheck:
         )
         source_text = "、".join(summary_freshness["sources"]) or "未知"
         nav_dates = summary_freshness.get("nav_dates") or []
+        if snapshot is not None:
+            nav_dates = []
+            try:
+                holdings = json.loads(snapshot.details_json or "{}").get("holdings", [])
+                nav_dates = sorted(
+                    {
+                        date.fromisoformat(item["valuation_date"])
+                        for item in holdings
+                        if isinstance(item, dict)
+                        and isinstance(item.get("valuation_date"), str)
+                    }
+                )
+            except (AttributeError, TypeError, ValueError):
+                nav_dates = []
         if not nav_dates:
             nav_date_text = "未知"
         elif len(nav_dates) == 1:

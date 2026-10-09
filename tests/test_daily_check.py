@@ -209,6 +209,81 @@ def test_daily_check_uses_stored_nav_without_constructing_market_providers(
     ]
 
 
+def test_daily_check_skips_opportunity_when_overlap_is_not_persisted(
+    db_session, monkeypatch
+):
+    account = Account(name="Broker", kind="investment")
+    held = Asset(code="000001", market="CN", name="Held", asset_class="fund")
+    candidate = Asset(
+        code="000002",
+        market="CN",
+        name="Candidate",
+        asset_class="fund",
+        portfolio_role=PortfolioRole.CORE,
+    )
+    db_session.add_all([account, held, candidate])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Holding(
+                account_id=account.id,
+                asset_id=held.id,
+                quantity=Decimal(100),
+                updated_at=NOW,
+            ),
+            PriceSnapshot(
+                asset_id=held.id,
+                valuation_date=date(2026, 9, 22),
+                source="eastmoney",
+                price=Decimal("1.234"),
+                quote_type="official_nav",
+                fetched_at=NOW - timedelta(hours=1),
+            ),
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(
+                bucket_kind="investment", balance_cents=20_000, updated_at=NOW
+            ),
+            AllocationTarget(name="core", target_bps=7000),
+        ]
+        + [
+            MonthlyBudget(month="2026-09", bucket_kind=kind, amount_cents=amount)
+            for kind, amount in {
+                "fixed_expense": 270_000,
+                "reserve": 100_000,
+                "investment": 20_000,
+                "discretionary": 10_000,
+            }.items()
+        ]
+        + [
+            PriceSnapshot(
+                asset_id=candidate.id,
+                valuation_date=date(2026, 1, 16) + timedelta(days=index),
+                source="efinance",
+                price=Decimal("1.5"),
+                quote_type="official_nav",
+                fetched_at=NOW - timedelta(hours=1),
+            )
+            for index in range(250)
+        ]
+    )
+    db_session.commit()
+
+    def reject_provider(*args, **kwargs):
+        raise AssertionError("daily advice must not construct market providers")
+
+    monkeypatch.setattr("finance_app.cli.EfinanceAdapter", reject_provider)
+    monkeypatch.setattr(
+        DailyCheck,
+        "notify",
+        lambda self, notification, **kwargs: DeliveryStatus.SUCCESS,
+    )
+
+    result = DailyCheck(db_session, clock=lambda: NOW).run(date(2026, 9, 23))
+
+    assert result is DailyCheckResult.SUCCESS
+    assert db_session.scalar(select(OpportunityAlert)) is None
+
+
 def test_daily_digest_combines_general_advice_and_discloses_unknown_data(db_session):
     check = RecordingDailyCheck(db_session, clock=lambda: NOW)
 
@@ -498,6 +573,54 @@ def test_digest_labels_selected_official_nav_dates(
     assert body.splitlines()[4] == expected_label
     assert "今日收盘净值" not in body
     assert "请手工补录" not in body
+
+
+def test_digest_uses_official_nav_date_selected_by_snapshot(db_session):
+    account = Account(name="Broker", kind="investment")
+    asset = Asset(code="000001", market="CN", name="Fund", asset_class="fund")
+    db_session.add_all([account, asset])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Holding(
+                account_id=account.id,
+                asset_id=asset.id,
+                quantity=Decimal(1),
+                updated_at=NOW,
+            ),
+            CashBucket(bucket_kind="reserve", balance_cents=100_000, updated_at=NOW),
+            CashBucket(
+                bucket_kind="investment", balance_cents=20_000, updated_at=NOW
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 9, 22),
+                source="eastmoney",
+                price=Decimal("1.2"),
+                quote_type="official_nav",
+                fetched_at=datetime(2026, 9, 22, 16, 0, tzinfo=UTC),
+            ),
+            PriceSnapshot(
+                asset_id=asset.id,
+                valuation_date=date(2026, 9, 23),
+                source="eastmoney",
+                price=Decimal("9.9"),
+                quote_type="official_nav",
+                fetched_at=datetime(2026, 9, 22, 15, 0, tzinfo=UTC),
+            ),
+        ]
+    )
+    db_session.flush()
+    check = DailyCheck(db_session, clock=lambda: NOW)
+
+    freshness = check.validate_freshness(date(2026, 9, 23))
+    snapshot = check.create_snapshot(date(2026, 9, 23), freshness)
+    details = json.loads(snapshot.details_json)
+    body = check.build_digest(date(2026, 9, 23), snapshot, freshness, []).body
+
+    assert details["holdings"][0]["valuation_date"] == "2026-09-22"
+    assert "官方净值日期：2026-09-22" in body
+    assert "官方净值日期：2026-09-23" not in body
 
 
 def test_allocation_targets_trigger_satellite_reduction(db_session):

@@ -42,6 +42,32 @@ class PerCodeProvider:
         )
 
 
+class PerCodeHistoryProvider:
+    source = "test:history"
+    source_url = "https://example.test/history"
+
+    def __init__(self, *, failing_codes: set[str] | None = None) -> None:
+        self.failing_codes = failing_codes or set()
+        self.calls: list[str] = []
+
+    def fetch_history(
+        self, fund_code: str, *, limit: int = 500
+    ) -> list[FundNavQuote]:
+        self.calls.append(fund_code)
+        if fund_code in self.failing_codes:
+            raise RuntimeError(f"history failed for {fund_code}")
+        return [
+            FundNavQuote(
+                value=Decimal("1.1111"),
+                valuation_date=date(2026, 9, 28),
+                source=self.source,
+                source_url=self.source_url,
+                fetched_at=EVENING_NOW,
+                quote_type=QuoteType.OFFICIAL_NAV,
+            )
+        ]
+
+
 def seed_refresh_scope(db_session, *, include_second: bool = True):
     first_account = Account(name="Primary", kind="investment")
     second_account = Account(name="Secondary", kind="investment")
@@ -158,6 +184,50 @@ def test_job_with_no_holdings_succeeds_with_zero_counts(db_session):
     ).refresh_held_funds()
 
     assert result == NavSyncResult("success", 0, 0, 0, 0)
+
+
+def test_job_backfills_history_for_unheld_tracked_fund(db_session):
+    candidate = Asset(
+        code="000099", market="CN", name="Candidate", asset_class="fund"
+    )
+    db_session.add(candidate)
+    db_session.commit()
+    history = PerCodeHistoryProvider()
+
+    result = OfficialNavSyncJob(
+        db_session,
+        providers=[PerCodeProvider()],
+        history_provider=history,
+        clock=lambda: EVENING_NOW,
+    ).run_scheduled()
+
+    assert result == NavSyncResult("success", 0, 0, 0, 0)
+    assert history.calls == [candidate.code]
+    row = db_session.scalar(select(PriceSnapshot))
+    assert row is not None
+    assert row.asset_id == candidate.id
+    assert row.quote_type == QuoteType.OFFICIAL_NAV.value
+
+
+def test_history_failure_for_one_tracked_fund_does_not_block_another(db_session):
+    failed = Asset(code="000098", market="CN", name="Failed", asset_class="fund")
+    succeeded = Asset(
+        code="000099", market="CN", name="Succeeded", asset_class="fund"
+    )
+    db_session.add_all([failed, succeeded])
+    db_session.commit()
+    history = PerCodeHistoryProvider(failing_codes={failed.code})
+
+    OfficialNavSyncJob(
+        db_session,
+        providers=[PerCodeProvider()],
+        history_provider=history,
+        clock=lambda: EVENING_NOW,
+    ).run_scheduled()
+
+    assert history.calls == [failed.code, succeeded.code]
+    rows = list(db_session.scalars(select(PriceSnapshot)))
+    assert [row.asset_id for row in rows] == [succeeded.id]
 
 
 def test_evening_holiday_is_skipped_but_morning_backfill_runs(db_session):
